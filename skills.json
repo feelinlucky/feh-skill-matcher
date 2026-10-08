@@ -1,0 +1,35 @@
+[
+  {
+    "id": "bonus_doubler_4",
+    "name": "Bonus Doubler 4",
+    "slot": "A",
+    "sp": 300,
+    "weapon_req": ["All"],
+    "move_req": ["Infantry", "Armored", "Cavalry", "Flying"],
+    "tags": ["visible_buff_scaling", "stat_boost"],
+    "synergies": ["visible_buff_grant", "field_buff"],
+    "description": "Grants Atk/Spd/Def/Res+X during combat (X = highest Bonus on respective stat among unit and allies within 2 spaces)."
+  },
+  {
+    "id": "atk_spd_pledge",
+    "name": "Atk/Spd Pledge",
+    "slot": "C",
+    "sp": 300,
+    "weapon_req": ["Sword", "Lance", "Axe", "Dragon", "Beast"],
+    "move_req": ["Infantry"],
+    "tags": ["visible_buff_grant", "special_acceleration", "field_buff"],
+    "synergies": ["visible_buff_scaling", "high_cooldown_special"],
+    "description": "At start of turn, grants Atk/Spd+6 to unit for 1 turn. During combat, grants Special cooldown charge +1 per attack."
+  },
+  {
+    "id": "godlike_reflexes",
+    "name": "Godlike Reflexes",
+    "slot": "Special",
+    "sp": 500,
+    "weapon_req": ["Sword", "Lance", "Axe"],
+    "move_req": ["Infantry"],
+    "tags": ["damage_reduction", "high_cooldown_special", "speed_scaling"],
+    "synergies": ["special_acceleration", "tempo", "phantom_spd"],
+    "description": "Reduces damage from foe's attack by 40%. Boosts damage dealt by 15% of Speed."
+  }
+]
