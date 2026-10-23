@@ -258,6 +258,21 @@ Extraction caveats that shaped the model:
 * the score is *relative output*, not a win rate: it ignores follow-ups, cooldown, Canto and other
   utility, so those skills can score `0.0` and still be listed when they answer a synergy need.
 
+## Dismissing skills
+
+Not every top-scoring skill is one you own or have fodder for. The `✕` in the corner of a
+recommendation card hides that skill from the list; the next-best candidate immediately moves up,
+so a slot keeps showing five options for as long as five remain.
+
+* Dismissed ids live in `state.dismissed` (a `Set`) and are written to
+  `localStorage["feh-skill-matcher:dismissed"]`, so the choice survives a refresh or a shared
+  `#unit=…` link. Storage failures (private mode, full quota) fall back to the in-memory set.
+* The dismissal applies to the recommendation cards **and** to the slot dropdowns, because both
+  describe what you could equip. A skill that is already chosen (or comes from the hero's default
+  kit) stays visible, otherwise the field could not render its own value.
+* A bar above the grids shows `N skills dismissed` — hover it for the names — with a
+  **Restore dismissed skills** button that clears the set and re-renders everything.
+
 ## Development
 
 It is a static site; no build step is needed for the frontend.
