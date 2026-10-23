@@ -99,6 +99,11 @@ Spd seal is ranked as the best answer to a Spd check.
   "max_tier": true,
   "is_sub_tier": false,
   "recommendable": true,
+  "output": {
+    "ally": { "atk": { "visible": 6, "combat": 3 }, "spd": { "visible": 6, "combat": 3 } },
+    "true_damage": { "flat": 5, "pct": [{ "stats": ["Spd"], "value": 15 }] },
+    "dr": 30
+  },
   "desc": "At start of turn, …"
 }
 ```
@@ -117,7 +122,7 @@ Skill data comes from [`matxx/feh-data`](https://github.com/matxx/feh-data), clo
 | `data/skills.json`, `data/skills-descriptions.json` | `data/skills.json` | 3,500 skills (from 6,350 raw) with slot, SP, might, cooldown, restrictions, wording, modifier tiers, named effects, synergy targets and the top-tier flags described below |
 | `data/units.json`, `data/skills_units.json` | `data/units.json` | 1,400+ heroes with weapon / move type, default kit and own prf skills |
 | `scripts/effects_catalog.py` | `data/effects.json` | the named-effect catalog and the synergy rule table |
-| `scripts/meta_rules.py` | `data/meta.json` | the top-tier policy: SP floors, prf/sub-tier rules and the sort order the UI applies |
+| `scripts/meta_rules.py` | `data/meta.json` | the top-tier policy: SP floors, prf/sub-tier rules, scoring weights and the sort order the UI applies |
 
 Rebuild after updating the data:
 
@@ -127,7 +132,11 @@ git clone https://github.com/matxx/feh-data feh-data
 
 python3 scripts/build_data.py                                  # writes data/*.json
 python3 scripts/build_data.py --source /path/to/feh-data/data   # or point at an existing clone
+python3 scripts/build_data.py --rescore                        # recompute scores from data/skills.json only
 ```
+
+`--rescore` rebuilds just the max-condition `output` block from the committed wording, so the
+scoring model can be tuned without the 50 MB raw export.
 
 The generated files are committed so GitHub Pages can serve the site without the raw export.
 
@@ -184,11 +193,10 @@ per slot: total / recommendable / exclusive
   ...
 ```
 
-**Ordering.** Synergy decides *which* skills qualify — a candidate still needs a named-effect or
-stat reason to appear — but the displayed list is then ordered top-tier first:
-relevance shortlist (≥ 60% of the best score, padded for thin slots) → **SP desc → release version
-desc → name asc**. The slot dropdowns use the same `SP → version → name` order, so the newest tier-4
-passive sits at the top of the list instead of the beta-era skill with the best stat line.
+**Ordering.** Synergy decides *which* skills qualify when a build is loaded — a candidate still
+needs a named-effect or stat reason to appear — and the surviving list is then sorted by the
+[estimated output score](#max-condition-output-score) (highest first), with `SP desc → version desc
+→ name asc` as the tie-break. The slot dropdowns keep the plain `SP → version → name` order.
 
 **The scope switch.** The *include prf & off-meta* chip in the filter panel relaxes both gates for
 browsing: unit-exclusive skills and prerequisite rows that survived the build become selectable and
@@ -203,6 +211,52 @@ python3 scripts/build_data.py --keep-legacy   # skip prune_legacy(), keep every 
 `data/meta.json` records the active policy (`spFloors`, `floorNotes`, `slotLabels`, `rules`,
 `pruned`), and the UI reads it at runtime — so the floors and the note in the filter panel always
 match the data file that shipped with them.
+
+## Max-condition output score
+
+Every recommendation is scored by the numbers it actually produces, assuming **all of its
+conditions are met** (movement, nearby allies, HP thresholds, foe penalties). The card shows the
+breakdown, e.g. `estimated max output · +15 Atk/Spd · −7 Spd/Res on foe · +25 true damage · 30% DR`,
+next to the numeric score used for sorting.
+
+### Step 1 — compatibility and inheritability
+
+A skill enters the candidate pool for a slot only if:
+
+* the scoped unit can hold it — weapon type (`res.weapons.can_use` / `can_not_use`) and movement
+  type (`res.moves`) both have to allow it; and
+* it is not unit-exclusive — prf weapons, prf passives and refines of other heroes are dropped
+  (a hero's own prf skills stay selectable from their default kit); and
+* it is a max-tier, top-SP skill — the rules in [Top-tier recommendations](#top-tier-recommendations).
+
+The unit scope is either a **hero** (search field) or a **weapon + movement archetype** (two
+selects in the filter panel); picking an archetype clears the hero, and both can be shared through
+the URL (`#wt=sword&mv=Infantry`). With neither set, the page lists everything and scores it.
+
+### Step 2 — scoring
+
+`data/skills.json` carries the extracted numbers per skill (`output`), and `data/meta.json` carries
+the weights, so the published policy and the rendered score cannot drift:
+
+| component | how it is counted |
+| --- | --- |
+| in-combat stat boosts, flat stat changes | summed per stat |
+| visible field buffs / debuffs | **highest source only** — a second Atk+6 does not add another +6 |
+| foe debuffs (`inflicts Atk/Spd-7 on foe`) | counted once for the visible tier, stacked for the in-combat tier, weight `0.9` |
+| `deals +N damage` | `N` points of true damage |
+| `damage = 15% of unit's Spd` / `boosts damage by 80% of the greater of Spd or Def` | `% × baseline stat` (Spd 50, Atk 60, Def 45, Res 40) |
+| `reduces damage by 30%` | `30 × 0.2` points; capped at 80% |
+
+Extraction caveats that shaped the model:
+
+* parenthetical worked examples are removed before reading numbers — Atk/Def Unity's
+  "…grants Atk+19, for a net bonus of Atk+12" would otherwise score +31;
+* within one tier only the largest clause counts, because repeats describe the same bonus;
+* area-of-effect-only damage reduction and "reduces damage by 25% of unit's Def" formulas are not
+  treated as flat damage reduction;
+* a single stat is capped at +20 per skill to keep formula remnants from dominating;
+* the score is *relative output*, not a win rate: it ignores follow-ups, cooldown, Canto and other
+  utility, so those skills can score `0.0` and still be listed when they answer a synergy need.
 
 ## Development
 

@@ -46,6 +46,21 @@ FLOOR_NOTES: dict[str, str] = {
     "sacredseal": "max sacred-seal tier",
 }
 
+# "Max conditionals" scoring: every requirement in the wording is assumed
+# satisfied, so a skill is valued at the strongest output it can produce.
+# The UI reads these numbers from data/meta.json when it ranks candidates, so
+# the published policy and the rendered score cannot drift apart.
+SCORING = {
+    "assumption": "all conditions active (movement, HP, nearby allies, foe penalties)",
+    "statWeights": {"Atk": 1.0, "Spd": 1.0, "Def": 1.0, "Res": 1.0},
+    "foeWeight": 0.9,             # a -7 on the foe is worth slightly less than +7 for us
+    "trueDamageWeight": 1.0,      # one point of true damage ~ one point of Atk
+    "damageReductionWeight": 0.2, # 30% DR ~ 6 stat points of survivability
+    "maxDamageReduction": 80,
+    # Fallback stat line used to turn "15% of unit's Spd" into a point value.
+    "percentBaselines": {"Atk": 60, "Spd": 50, "Def": 45, "Res": 40},
+}
+
 SLOT_LABELS = {
     "weapon": "Weapon",
     "assist": "Assist",
@@ -99,7 +114,12 @@ def policy(pruned: bool) -> dict:
             "exclusive": "unit-exclusive (prf) skills are never recommended",
             "maxTier": "only the terminal node of an upgrade line is recommended",
             "spFloor": "per-slot SP floor removes legacy lines with no successor",
-            "sort": ["synergy score", "SP desc", "version desc", "name asc"],
+            "sort": ["estimated output desc", "SP desc", "version desc", "name asc"],
+            "scoring": (
+                "max-condition stat + damage output; visible field buffs are taken once "
+                "(highest source), in-combat stats and true damage accumulate"
+            ),
         },
+        "scoring": SCORING,
         "pruned": pruned,
     }

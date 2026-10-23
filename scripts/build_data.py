@@ -45,6 +45,7 @@ import re
 from pathlib import Path
 
 from meta_rules import (
+    SCORING,
     SP_FLOORS,
     is_recommendable,
     policy,
@@ -542,6 +543,139 @@ def analyse_skill(desc: str, category: str, cd: int | None, name: str = "") -> d
 
 
 # --------------------------------------------------------------------------- #
+# max-condition output model
+# --------------------------------------------------------------------------- #
+# The scorer answers "how much does this skill actually give me when everything
+# lines up". FEH wording hides worked examples in parentheses
+# ("... grants Atk+19, for a net bonus of Atk+12"), so parentheticals are
+# dropped before any number is read; without that, Atk/Def Unity scores +31.
+PAREN_RE = re.compile(r"\([^()]*\)")
+PCT_DAMAGE_RE = re.compile(
+    r"damage\s*=\s*(\d+)%\s*of\s*unit'?s\s*(Atk|Spd|Def|Res)", re.I)
+# Specials phrase the same idea as "boosts damage by 80% of the greater of
+# unit's Spd or Def".
+BOOST_DAMAGE_RE = re.compile(
+    r"boosts damage by\s*(\d+)%\s*of\s*(?:the greater of\s*)?unit'?s\s*"
+    r"((?:Atk|Spd|Def|Res)(?:\s*or\s*(?:Atk|Spd|Def|Res))?)", re.I)
+FLAT_DAMAGE_RE = re.compile(r"deal(?:s|t|ing)?\s*\+(\d+)\s*damage", re.I)
+DR_RE = re.compile(r"reduces damage[^.;]{0,140}?by\s*(\d+)%", re.I)
+# A hard cap keeps formula remnants ("+X = 2 x penalty" with X pre-filled by
+# the export) from dominating a score. No legal inheritance skill exceeds this
+# on a single stat under max conditions.
+MAX_STAT_OUTPUT = 20
+MAX_TRUE_DAMAGE = 40
+
+
+def strip_examples(text: str) -> str:
+    """Remove parenthetical asides, including nested ones."""
+    previous = None
+    while previous != text:
+        previous = text
+        text = PAREN_RE.sub(" ", text)
+    return text
+
+
+def analyse_output(desc: str, category: str) -> dict:
+    """Numeric output of a skill with every condition treated as active.
+
+    ``ally`` / ``foe`` map a stat to ``{visible, flat, combat}``. Within one
+    tier only the strongest clause survives: repeat wordings ("if unit is within
+    2 spaces ... grants Atk+3"; "at start of combat ... grants Atk+3") describe
+    the same bonus, so summing them double-counts. Field buffs are marked
+    ``visible`` because only the highest field buff applies to a stat.
+    """
+    body = strip_examples(main_text(desc))
+    best: dict[tuple[str, str, str], int] = {}
+
+    for clause, sentence_text in split_clauses(body):
+        if len(clause) < 8:
+            continue
+        deltas = parse_stat_deltas(clause)
+        if not deltas:
+            continue
+        tier = clause_tier(clause, category, sentence_text)
+        if tier == "phantom":
+            continue
+        target = clause_target(clause)
+        for stat, value in deltas.items():
+            if not value:
+                continue
+            key = (target, tier, stat)
+            # "max conditions" = whichever wording of the bonus is largest;
+            # a self-inflicted drop (Brave weapons, Life and Death) is always
+            # on, so it survives on its own tier.
+            if abs(value) >= abs(best.get(key, 0)):
+                best[key] = value
+
+    output: dict = {"ally": {}, "foe": {}}
+    for (target, tier, stat), value in best.items():
+        value = max(-MAX_STAT_OUTPUT, min(MAX_STAT_OUTPUT, value))
+        bucket = output[target].setdefault(stat.lower(), {})
+        bucket[tier] = value
+    for side in ("ally", "foe"):
+        output[side] = {stat: tiers for stat, tiers in sorted(output[side].items()) if tiers}
+        if not output[side]:
+            output.pop(side)
+
+    flat_damage = [int(m) for m in FLAT_DAMAGE_RE.findall(body)]
+    if flat_damage:
+        output["true_damage"] = {"flat": min(max(flat_damage), MAX_TRUE_DAMAGE)}
+    pct: dict[tuple[str, ...], int] = {}
+    for amount, stat in PCT_DAMAGE_RE.findall(body):
+        pct[(stat,)] = max(pct.get((stat,), 0), min(int(amount), 100))
+    for amount, stats in BOOST_DAMAGE_RE.findall(body):
+        names = tuple(part.strip() for part in re.split(r"\s*or\s*", stats))
+        pct[names] = max(pct.get(names, 0), min(int(amount), 100))
+    if pct:
+        output.setdefault("true_damage", {})["pct"] = [
+            {"stats": list(names), "value": value}
+            for names, value in sorted(pct.items())
+        ]
+
+    dr = []
+    for match in DR_RE.finditer(body):
+        phrase = match.group(0).lower()
+        # "reduces the percentage of foe's non-Special 'reduce damage by X%'
+        # skills by 50%" strips DR, it is not DR.
+        if "non-special" in phrase or "x%" in phrase or "reduce damage" in phrase[7:]:
+            continue
+        # "reduces damage ... by 25% of unit's Def" is a formula, not a fixed %.
+        tail = body[match.end():match.end() + 24].lower()
+        if "of unit" in tail or "of foe" in tail or "of their" in tail:
+            continue
+        # "Reduces damage from area-of-effect Specials by 80%" is not a DR stat.
+        if "area-of-effect" in phrase or "røkkr" in phrase:
+            continue
+        dr.append(int(match.group(1)))
+    if dr:
+        output["dr"] = min(max(dr), 100)
+    return output
+
+
+def output_score(output: dict) -> float:
+    """Python mirror of the UI score, used for the build report only."""
+    weights = SCORING["statWeights"]
+    score = 0.0
+    for side in ("ally", "foe"):
+        for stat, tiers in (output.get(side) or {}).items():
+            total = sum(value for tier, value in tiers.items() if tier != "phantom")
+            if side == "foe":
+                total = -total  # a foe debuff is a gain for us, a buff a loss
+            else:
+                total = total   # self-inflicted drops count against the skill
+            score += total * weights.get(stat.capitalize(), 1.0) * (
+                SCORING["foeWeight"] if side == "foe" else 1.0)
+    damage = output.get("true_damage") or {}
+    score += damage.get("flat", 0) * SCORING["trueDamageWeight"]
+    for entry in damage.get("pct", []):
+        names = entry.get("stats") or [entry.get("stat", "Atk")]
+        baseline = max(SCORING["percentBaselines"].get(name, 50) for name in names)
+        score += (entry["value"] / 100) * baseline
+    score += min(output.get("dr", 0), SCORING["maxDamageReduction"]) * SCORING["damageReductionWeight"]
+    return round(score, 2)
+
+
+# --------------------------------------------------------------------------- #
 # build
 # --------------------------------------------------------------------------- #
 
@@ -637,6 +771,7 @@ def build(source: Path, out_dir: Path, keep_legacy: bool = False) -> None:
             "synergy_targets": analysis["synergy_targets"],
             "check_stats": analysis["check_stats"],
             "clauses": analysis["clauses"],
+            "output": analyse_output(desc, category),
         }
         if raw.get("base_id"):
             entry["base"] = raw["base_id"]
@@ -734,6 +869,31 @@ def write_json(path: Path, payload) -> None:
         json.dump(payload, fh, ensure_ascii=False, separators=(",", ":"))
 
 
+def rescore(out_dir: Path) -> None:
+    """Recompute only ``output`` from the committed skill text.
+
+    The raw export is not needed for this pass, so the score model can be
+    tuned against shipped data with `python3 scripts/build_data.py --rescore`.
+    """
+    path = out_dir / "skills.json"
+    skills = load(path)
+    for skill in skills:
+        skill["output"] = analyse_output(skill.get("desc", ""), skill["cat"])
+    write_json(path, skills)
+
+    meta_path = out_dir / "meta.json"
+    pruned = True
+    if meta_path.exists():
+        pruned = bool(load(meta_path).get("pruned", True))
+    write_json(meta_path, policy(pruned=pruned))
+
+    scored = sorted(skills, key=lambda s: output_score(s["output"]), reverse=True)
+    print(f"rescored {len(skills)} skills -> {path}")
+    print("\ntop max-condition output:")
+    for skill in scored[:12]:
+        print(f"  {output_score(skill['output']):6.1f}  {skill['name']}")
+
+
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -744,7 +904,15 @@ def main() -> None:
         action="store_true",
         help="also write prerequisite / below-floor skills (flagged, never recommended)",
     )
+    parser.add_argument(
+        "--rescore",
+        action="store_true",
+        help="recompute the max-condition output block from data/skills.json only",
+    )
     args = parser.parse_args()
+    if args.rescore:
+        rescore(args.out)
+        return
     if not (args.source / "skills.json").exists():
         raise SystemExit(
             f"missing {args.source / 'skills.json'}\n"
