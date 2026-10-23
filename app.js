@@ -119,6 +119,28 @@ const data = {
   loaded: false,
 };
 
+// Skills the user has dismissed ("I do not own this / have no fodder"). They
+// survive reloads through localStorage and are filtered out before ranking.
+const DISMISS_KEY = 'feh-skill-matcher:dismissed';
+
+function loadDismissed() {
+  try {
+    const raw = window.localStorage.getItem(DISMISS_KEY);
+    const ids = raw ? JSON.parse(raw) : [];
+    return new Set(Array.isArray(ids) ? ids.filter((id) => typeof id === 'string') : []);
+  } catch (error) {
+    return new Set();
+  }
+}
+
+function saveDismissed() {
+  try {
+    window.localStorage.setItem(DISMISS_KEY, JSON.stringify([...state.dismissed]));
+  } catch (error) {
+    // Private mode or a full quota: the in-memory set still works this session.
+  }
+}
+
 const state = {
   unit: null,
   picks: Object.fromEntries(SLOTS.map((slot) => [slot.key, null])),
@@ -127,6 +149,7 @@ const state = {
   archetype: { weapon: '', move: '' },
   // Legacy / prf skills are hidden from every list unless this is switched on.
   showLegacy: false,
+  dismissed: loadDismissed(),
 };
 
 const combos = {};
@@ -512,6 +535,7 @@ function buildOptions(slot) {
 
   return pool
     .filter((skill) => inheritable(skill) && passesFilters(skill))
+    .filter((skill) => !isDismissed(skill) || keepIds.has(skill.id))
     .filter((skill) => state.showLegacy || isRecommendable(skill) || keepIds.has(skill.id))
     .sort(compareMeta)
     .map((skill) => ({
@@ -1169,6 +1193,7 @@ function rankCandidates(slot, anchors) {
     isRecommendable(skill)                       // no prf, no prerequisite, SP floor
     && inheritable(skill)                        // weapon / movement / ownership
     && !taken.has(skill.id)                      // never offer a skill already equipped
+    && !isDismissed(skill)                       // hidden by the user
     && passesFilters(skill)
   ));
 
@@ -1222,6 +1247,52 @@ function effectChips(skill, limit = 3) {
   return chips.join('');
 }
 
+/* ------------------------------------------------------------------ */
+/* dismissed skills                                                    */
+/* ------------------------------------------------------------------ */
+
+function isDismissed(skill) {
+  return Boolean(skill) && state.dismissed.has(skill.id);
+}
+
+function dismissSkill(id) {
+  if (!id || state.dismissed.has(id)) return;
+  state.dismissed.add(id);
+  saveDismissed();
+  // The slot dropdowns hold their own option list, so they need a resync.
+  if (combos.weapon) syncSlotOptions();
+  refresh();
+}
+
+function restoreDismissed() {
+  if (!state.dismissed.size) return;
+  state.dismissed.clear();
+  saveDismissed();
+  if (combos.weapon) syncSlotOptions();
+  refresh();
+}
+
+// "3 skills dismissed — Agnea's Arrow, Flare, …" so the bar is not anonymous.
+function dismissedTitle() {
+  const names = [...state.dismissed]
+    .map((id) => data.skillById.get(id)?.name)
+    .filter(Boolean);
+  if (!names.length) return 'Dismissed skills are hidden from recommendations.';
+  const shown = names.slice(0, 12).join(', ');
+  return `${shown}${names.length > 12 ? ` and ${names.length - 12} more` : ''}`;
+}
+
+function renderDismissBar() {
+  const bar = $('dismiss-bar');
+  if (!bar) return;
+  const count = state.dismissed.size;
+  bar.hidden = count === 0;
+  if (!count) return;
+  $('dismiss-count').textContent = `${count} skill${count === 1 ? '' : 's'} dismissed`;
+  $('dismiss-count').title = dismissedTitle();
+  $('dismiss-restore').textContent = count === 1 ? 'Restore dismissed skill' : 'Restore dismissed skills';
+}
+
 function renderSuggestions() {
   const host = $('suggestions');
   const anchors = selectedSkills();
@@ -1258,15 +1329,22 @@ function renderSuggestions() {
         <ul class="suggest-list">
           ${ranked.map(({ skill, reasons, score, parts }) => `
             <li>
-              <button type="button" class="suggest-item" data-slot="${esc(slot.key)}" data-id="${esc(skill.id)}">
+              <div class="suggest-item" role="button" tabindex="0"
+                   data-slot="${esc(slot.key)}" data-id="${esc(skill.id)}"
+                   aria-label="Add ${esc(skill.name)} to ${esc(slot.label)}">
                 <span class="si-top">
                   <span class="si-name">${esc(skill.name)}</span>
-                  <span class="si-meta">${esc(metaLine(skill))}</span>
+                  <span class="si-right">
+                    <span class="si-meta">${esc(metaLine(skill))}</span>
+                    <button type="button" class="dismiss-btn" data-dismiss="${esc(skill.id)}"
+                            title="Dismiss — hide this skill from recommendations"
+                            aria-label="Dismiss ${esc(skill.name)}">&#10005;</button>
+                  </span>
                 </span>
                 ${outputLine(skill, { score, parts })}
                 ${reasons.length ? `<span class="si-why">${reasonList(reasons)}</span>` : ''}
                 <span class="si-effects">${effectChips(skill)}</span>
-              </button>
+              </div>
             </li>`).join('')}
         </ul>
       </div>`);
@@ -1280,7 +1358,7 @@ function renderSuggestions() {
     : '';
 
   const barrenNote = blocks.length && barren.length
-    ? `<p class="empty-note barren-note">No direct synergy found for ${barren.length === 1 ? '' : 'the '}${esc(barren.join(', '))} slot${barren.length === 1 ? '' : 's'} — pick from the full list, or add another skill to widen the search.</p>`
+    ? `<p class="empty-note barren-note">No direct synergy found for ${barren.length === 1 ? '' : 'the '}${esc(barren.join(', '))} slot${barren.length === 1 ? '' : 's'} — pick from the full list, or add another skill to widen the search.${state.dismissed.size ? ' Dismissed skills stay hidden until you restore them.' : ''}</p>`
     : '';
 
   host.innerHTML = (blocks.join('') + barrenNote) || `<p class="empty-note">${emptyBecauseFilters
@@ -1301,6 +1379,7 @@ function refresh({ syncOptions = false } = {}) {
   renderCharacter();
   renderEffects();
   renderConstants();
+  renderDismissBar();
   renderSuggestions();
   $('kit-note').textContent = state.unit
     ? (Object.keys(state.unit.kit || {}).length ? 'default kit prefilled' : 'no default kit data')
@@ -1413,6 +1492,11 @@ async function loadData() {
 
 function bindStaticEvents() {
   $('suggestions').addEventListener('click', (event) => {
+    const dismiss = event.target.closest('[data-dismiss]');
+    if (dismiss) {
+      dismissSkill(dismiss.dataset.dismiss);
+      return;
+    }
     if (event.target.closest('[data-clear-filters]')) {
       Object.values(state.filters).forEach((set) => set.clear());
       renderFilters();
@@ -1420,12 +1504,25 @@ function bindStaticEvents() {
       refresh();
       return;
     }
-    const button = event.target.closest('.suggest-item');
-    if (!button) return;
-    const { slot, id } = button.dataset;
+    const card = event.target.closest('.suggest-item');
+    if (!card) return;
+    const { slot, id } = card.dataset;
     if (!slot || !combos[slot]) return;
     combos[slot].setValue(id, { silent: false });
   });
+
+  // The card is a div (a nested dismiss <button> rules out nesting buttons),
+  // so Enter / Space have to be wired up by hand.
+  $('suggestions').addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    const card = event.target.closest('.suggest-item');
+    if (!card || event.target.closest('[data-dismiss]')) return;
+    event.preventDefault();
+    const { slot, id } = card.dataset;
+    if (slot && combos[slot]) combos[slot].setValue(id, { silent: false });
+  });
+
+  $('dismiss-restore').addEventListener('click', restoreDismissed);
 
   bindFilterEvents();
 }
