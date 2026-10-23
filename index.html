@@ -17,9 +17,9 @@
         <h1>Skill Synergy Matcher</h1>
       </div>
       <p class="blurb">
-        Choose a hero to load their default kit, then tune each slot. The panels break the build
-        into what it grants, what it inflicts on foes, and the constants that stack up — and
-        suggest skills that fill the gaps.
+        Choose a hero to load their default kit, then tune each slot. Named effects are matched
+        against each other across slots, so the suggestion panel shows which mechanic a skill
+        answers — field buffs, flat stat checks, cooldown handling or follow-up control.
       </p>
     </header>
 
@@ -45,6 +45,21 @@
           <div class="slots" id="slots"></div>
         </section>
 
+        <section class="panel filter-panel">
+          <div class="panel-head">
+            <h2 class="panel-title">filters</h2>
+            <span class="panel-head-tools">
+              <span class="panel-note" id="filter-note">none</span>
+              <button type="button" class="link-button" id="filter-clear">clear</button>
+            </span>
+          </div>
+          <div class="filters" id="filters"></div>
+          <p class="filter-hint">
+            Narrows the slot lists and the suggested complements. Restrictions already applied
+            by the selected hero stay in force.
+          </p>
+        </section>
+
       </div>
 
       <!-- ── middle: effect breakdown ────────────────────────────────── -->
@@ -67,7 +82,7 @@
         <div class="targets" id="targets"></div>
         <div class="net-row" id="net-row"></div>
         <p class="const-note" id="const-note">
-          Visible bonuses and in-combat bonuses are tracked separately, then summed per target.
+          Field buffs, flat stat changes and in-combat modifiers are tracked separately, then summed per target.
         </p>
       </section>
 

@@ -10,39 +10,38 @@
 
 // Slots follow the UI draft: weapon, special, A, B, C, seal, X.
 const SLOTS = [
-  { key: 'weapon', cat: 'weapon', label: 'weapon' },
-  { key: 'special', cat: 'special', label: 'special' },
-  { key: 'a', cat: 'passivea', label: 'skill A' },
-  { key: 'b', cat: 'passiveb', label: 'skill B' },
-  { key: 'c', cat: 'passivec', label: 'skill C' },
-  { key: 'seal', cat: 'sacredseal', label: 'seal' },
-  { key: 'x', cat: 'passivex', label: 'skill X' },
+  { key: 'weapon', cat: 'weapon', slot: 'Weapon', label: 'weapon' },
+  { key: 'special', cat: 'special', slot: 'Special', label: 'special' },
+  { key: 'a', cat: 'passivea', slot: 'A', label: 'skill A' },
+  { key: 'b', cat: 'passiveb', slot: 'B', label: 'skill B' },
+  { key: 'c', cat: 'passivec', slot: 'C', label: 'skill C' },
+  { key: 'seal', cat: 'sacredseal', slot: 'Seal', label: 'seal' },
+  { key: 'x', cat: 'passivex', slot: 'X', label: 'skill X' },
 ];
 
 const STATS = ['Atk', 'Spd', 'Def', 'Res'];
 const COLORS = ['Red', 'Blue', 'Green', 'Colorless'];
 
-/* Complementary pairings used to rank suggestions.
-   [tagA, tagB, weight, reason shown to the user] */
-const SYNERGY = [
-  ['visible_buff', 'stat_scaling', 3, 'visible bonuses feed stat-scaling effects'],
-  ['in_combat_buff', 'stat_scaling', 3, 'in-combat bonuses feed stat-scaling effects'],
-  ['visible_buff', 'in_combat_buff', 1, 'overlapping bonus sources stack'],
-  ['special_acceleration', 'high_cd_special', 3, 'faster cooldown for a high-cooldown Special'],
-  ['special_ready', 'high_cd_special', 2, 'cooldown resets keep a heavy Special ready'],
-  ['special_acceleration', 'true_damage', 2, 'more Specials means more true damage'],
-  ['damage_reduction', 'healing', 2, 'sustain keeps damage reduction relevant'],
-  ['damage_reduction', 'phantom_stat', 1, 'stat comparisons power mitigation'],
-  ['damage_reduction', 'stat_scaling', 1, 'stat scaling powers mitigation'],
-  ['phantom_stat', 'stat_scaling', 2, 'phantom bonuses win stat comparisons'],
-  ['debuff', 'stat_scaling', 1, 'penalties widen stat comparisons'],
-  ['visible_debuff', 'damage_reduction', 1, 'weakening the foe softens the hit'],
-  ['true_damage', 'follow_up', 1, 'extra hits carry flat damage'],
-  ['follow_up', 'special_acceleration', 1, 'extra hits accelerate the Special'],
-  ['penalty_cleanse', 'visible_debuff', 1, 'cleansing answers penalty pressure'],
-  ['bonus_negation', 'visible_buff', 1, 'bonus negation punishes buff-heavy foes'],
-  ['cooldown_guard', 'high_cd_special', 1, 'cooldown control protects a heavy Special'],
-  ['effective_damage', 'stat_scaling', 1, 'scaling boosts effective damage'],
+// Modifier tiers, ordered from the most to the least permanent.
+const TIERS = [
+  { id: 'phantom', label: 'phantom', hint: 'counts for stat checks only' },
+  { id: 'flat', label: 'flat', hint: 'always-on stat line change' },
+  { id: 'visible', label: 'visible', hint: 'field buff / debuff for a turn' },
+  { id: 'combat', label: 'combat', hint: 'only during combat' },
+];
+
+const MOVE_TYPES = ['Infantry', 'Armored', 'Cavalry', 'Flying'];
+
+const WEAPON_GROUPS = [
+  { id: 'sword', label: 'sword', match: /Sword/ },
+  { id: 'lance', label: 'lance', match: /Lance/ },
+  { id: 'axe', label: 'axe', match: /Axe/ },
+  { id: 'bow', label: 'bow', match: /Bow/ },
+  { id: 'dagger', label: 'dagger', match: /Dagger/ },
+  { id: 'tome', label: 'tome', match: /Tome/ },
+  { id: 'staff', label: 'staff', match: /Staff/ },
+  { id: 'breath', label: 'breath', match: /Breath/ },
+  { id: 'beast', label: 'beast', match: /Beast/ },
 ];
 
 /* ------------------------------------------------------------------ */
@@ -66,6 +65,14 @@ function normalize(text) {
   return String(text ?? '').toLowerCase().replace(/[\u2019']/g, "'");
 }
 
+function statKey(key) {
+  const parts = key.split('_');
+  const stat = parts[parts.length - 1];
+  const tier = parts[parts.length - 2];
+  const side = parts.length > 2 ? parts[0] : 'ally';
+  return { side, tier, stat: stat.charAt(0).toUpperCase() + stat.slice(1) };
+}
+
 /* ------------------------------------------------------------------ */
 /* data + state                                                        */
 /* ------------------------------------------------------------------ */
@@ -73,15 +80,19 @@ function normalize(text) {
 const data = {
   skills: [],
   units: [],
+  catalog: { effects: [], targets: [], rules: {}, groups: [], statTierWeights: {} },
+  effectById: new Map(),
   skillById: new Map(),
   unitById: new Map(),
   byCat: new Map(),
+  effectCounts: new Map(),
   loaded: false,
 };
 
 const state = {
   unit: null,
   picks: Object.fromEntries(SLOTS.map((slot) => [slot.key, null])),
+  filters: { moves: new Set(), weapons: new Set(), effects: new Set() },
 };
 
 const combos = {};
@@ -95,8 +106,16 @@ function skillFor(key) {
   return id ? data.skillById.get(id) || null : null;
 }
 
+function effectLabel(id) {
+  return data.effectById.get(id)?.label || data.catalog.targets.find((t) => t.id === id)?.label || id;
+}
+
+function targetLabel(id) {
+  return data.catalog.targets.find((target) => target.id === id)?.label || id;
+}
+
 /* ------------------------------------------------------------------ */
-/* restrictions                                                        */
+/* restrictions + filters                                              */
 /* ------------------------------------------------------------------ */
 
 function tokenMatches(token, weaponType) {
@@ -115,6 +134,13 @@ function tokenMatches(token, weaponType) {
   return false;
 }
 
+function tokenMatchesGroup(token, groupId) {
+  const group = WEAPON_GROUPS.find((entry) => entry.id === groupId);
+  if (!group || !token) return false;
+  if (token === 'All Melee') return ['sword', 'lance', 'axe'].includes(groupId);
+  return group.match.test(token);
+}
+
 function compatible(skill, unit) {
   if (skill.prf) return Boolean(unit && unit.prf && unit.prf.includes(skill.id));
   if (!unit) return true;
@@ -125,6 +151,37 @@ function compatible(skill, unit) {
   if (moves.can_not_use && moves.can_not_use.includes(unit.mv)) return false;
   if (weapons.can_use && !weapons.can_use.some((token) => tokenMatches(token, unit.wt))) return false;
   if (weapons.can_not_use && weapons.can_not_use.some((token) => tokenMatches(token, unit.wt))) return false;
+  return true;
+}
+
+function skillAllowsMove(skill, move) {
+  if (skill.prf) return Boolean(state.unit && state.unit.mv === move);
+  const res = skill.res?.moves || {};
+  if (res.can_use && !res.can_use.includes(move)) return false;
+  if (res.can_not_use && res.can_not_use.includes(move)) return false;
+  return true;
+}
+
+function skillAllowsWeaponGroup(skill, groupId) {
+  if (skill.prf) {
+    return Boolean(state.unit && WEAPON_GROUPS.find((g) => g.id === groupId)?.match.test(state.unit.wt || ''));
+  }
+  const res = skill.res?.weapons || {};
+  if (res.can_use && !res.can_use.some((token) => tokenMatchesGroup(token, groupId))) return false;
+  if (res.can_not_use && res.can_not_use.some((token) => tokenMatchesGroup(token, groupId))) return false;
+  return true;
+}
+
+function hasActiveFilters() {
+  const { moves, weapons, effects } = state.filters;
+  return Boolean(moves.size || weapons.size || effects.size);
+}
+
+function passesFilters(skill) {
+  const { moves, weapons, effects } = state.filters;
+  if (moves.size && ![...moves].some((move) => skillAllowsMove(skill, move))) return false;
+  if (weapons.size && ![...weapons].some((group) => skillAllowsWeaponGroup(skill, group))) return false;
+  if (effects.size && ![...effects].some((effect) => skill.named_effects.includes(effect))) return false;
   return true;
 }
 
@@ -216,7 +273,8 @@ function createCombo(root, { placeholder, onChange, ariaLabel }) {
 
   function moveActive(delta) {
     if (!filtered.length) return;
-    active = (active + delta + Math.min(filtered.length, MAX_VISIBLE_OPTIONS)) % Math.min(filtered.length, MAX_VISIBLE_OPTIONS);
+    const count = Math.min(filtered.length, MAX_VISIBLE_OPTIONS);
+    active = (active + delta + count) % count;
     paintList();
     const node = list.querySelector('.combo-option.is-active');
     if (node) node.scrollIntoView({ block: 'nearest' });
@@ -300,7 +358,7 @@ function createCombo(root, { placeholder, onChange, ariaLabel }) {
     const index = Number(node.dataset.index);
     if (index === active) return;
     active = index;
-    list.querySelectorAll('.combo-option').forEach((node, i) => node.classList.toggle('is-active', i === index));
+    list.querySelectorAll('.combo-option').forEach((optionNode, i) => optionNode.classList.toggle('is-active', i === index));
   });
 
   document.addEventListener('click', (event) => {
@@ -310,9 +368,7 @@ function createCombo(root, { placeholder, onChange, ariaLabel }) {
   return {
     setOptions(next, { keep = true } = {}) {
       options = next;
-      if (keep && selectedId !== null && !optionById(selectedId)) {
-        selectedId = null;
-      }
+      if (keep && selectedId !== null && !optionById(selectedId)) selectedId = null;
       paintSelection();
       if (isOpen) applyFilter();
     },
@@ -331,14 +387,14 @@ function createCombo(root, { placeholder, onChange, ariaLabel }) {
 /* ------------------------------------------------------------------ */
 
 function metaFor(skill) {
-  if (skill.cat === 'weapon') {
+  if (skill.slot === 'Weapon') {
     const parts = [];
     if (skill.mt) parts.push(`${skill.mt} mt`);
     if (skill.rng) parts.push(`rng ${skill.rng}`);
     if (skill.sp) parts.push(`${skill.sp} SP`);
     return parts.join(' · ');
   }
-  if (skill.cat === 'special') {
+  if (skill.slot === 'Special') {
     const parts = [];
     if (skill.cd) parts.push(`cd ${skill.cd}`);
     if (skill.sp) parts.push(`${skill.sp} SP`);
@@ -363,15 +419,15 @@ function badgesFor(skill, unit) {
 function buildOptions(slot) {
   const pool = data.byCat.get(slot.cat) || [];
   return pool
-    .filter((skill) => compatible(skill, state.unit))
+    .filter((skill) => compatible(skill, state.unit) && passesFilters(skill))
     .map((skill) => ({
       id: skill.id,
       label: displayName(skill),
       meta: metaFor(skill),
-      shortMeta: skill.sp ? `${skill.sp} SP` : '', 
+      shortMeta: skill.sp ? `${skill.sp} SP` : '',
       note: badgesFor(skill, state.unit),
       refine: skill.refine || null,
-      keywords: [skill.fx && skill.fx.tags ? skill.fx.tags.join(' ') : '', skill.refine ? 'refine' : ''].join(' '),
+      keywords: skill.named_effects.join(' '),
     }))
     // Base skills first so the opening list is not a wall of refine variants.
     .sort((a, b) => (a.refine ? 1 : 0) - (b.refine ? 1 : 0)
@@ -390,8 +446,7 @@ function buildCharacterOptions() {
 }
 
 function renderSlots() {
-  const host = $('slots');
-  host.innerHTML = SLOTS.map((slot) => `
+  $('slots').innerHTML = SLOTS.map((slot) => `
     <div class="slot-row">
       <span class="slot-key" data-slot="${slot.key}" data-filled="false">${esc(slot.label)}</span>
       <div id="combo-${slot.key}"></div>
@@ -435,24 +490,118 @@ function renderCharacter() {
 }
 
 /* ------------------------------------------------------------------ */
-/* rendering: effects                                                  */
+/* rendering: filters                                                 */
 /* ------------------------------------------------------------------ */
 
-function collectEffects() {
-  const groups = { flat: [], buff: [], debuff: [], buffCombat: [], debuffCombat: [], constant: [], other: [] };
+function chipGroup(label, items, activeSet, kind) {
+  return `
+    <div class="filter-group">
+      <h3>${esc(label)}</h3>
+      <div class="filter-chips">
+        ${items.map((item) => `
+          <label class="chip ${activeSet.has(item.id) ? 'is-on' : ''}">
+            <input type="checkbox" data-filter="${kind}" value="${esc(item.id)}" ${activeSet.has(item.id) ? 'checked' : ''}>
+            <span>${esc(item.label)}</span>
+          </label>`).join('')}
+      </div>
+    </div>`;
+}
+
+function renderFilters() {
+  const { moves, weapons, effects } = state.filters;
+  const effectItems = [...data.catalog.effects]
+    .filter((effect) => (data.effectCounts.get(effect.id) || 0) > 0)
+    .sort((a, b) => (data.effectCounts.get(b.id) || 0) - (data.effectCounts.get(a.id) || 0)
+      || a.label.localeCompare(b.label, 'en'))
+    .map((effect) => ({ id: effect.id, label: `${effect.label} (${data.effectCounts.get(effect.id)})` }));
+
+  $('filters').innerHTML = [
+    chipGroup('movement', MOVE_TYPES.map((move) => ({ id: move, label: move })), moves, 'moves'),
+    chipGroup('weapon', WEAPON_GROUPS.map((group) => ({ id: group.id, label: group.label })), weapons, 'weapons'),
+    chipGroup('grants named effect', effectItems, effects, 'effects'),
+  ].join('');
+
+  updateFilterStatus();
+}
+
+function updateFilterStatus() {
+  const count = activeFilterCount();
+  $('filter-note').textContent = count ? `${count} active` : 'none';
+  $('filter-clear').disabled = count === 0;
+  $('filters').classList.toggle('has-active', count > 0);
+}
+
+function activeFilterCount() {
+  const { moves, weapons, effects } = state.filters;
+  return moves.size + weapons.size + effects.size;
+}
+
+function bindFilterEvents() {
+  $('filters').addEventListener('change', (event) => {
+    const input = event.target.closest('input[data-filter]');
+    if (!input) return;
+    const set = state.filters[input.dataset.filter];
+    if (input.checked) set.add(input.value);
+    else set.delete(input.value);
+    input.closest('.chip')?.classList.toggle('is-on', input.checked);
+    updateFilterStatus();
+    syncSlotOptions();
+    refresh();
+  });
+
+  $('filter-clear').addEventListener('click', () => {
+    Object.values(state.filters).forEach((set) => set.clear());
+    renderFilters();
+    syncSlotOptions();
+    refresh();
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* rendering: effect breakdown                                         */
+/* ------------------------------------------------------------------ */
+
+const CLAUSE_GROUPS = [
+  { kind: 'buff', tier: 'visible', title: 'field buffs' },
+  { kind: 'debuff', tier: 'visible', title: 'field debuffs' },
+  { kind: 'buff', tier: 'flat', title: 'flat stat changes' },
+  { kind: 'debuff', tier: 'flat', title: 'flat stat drops' },
+  { kind: 'buff', tier: 'phantom', title: 'phantom stats' },
+  { kind: 'flat', tier: 'phantom', title: 'phantom / stat-check modifiers' },
+  { kind: 'buff', tier: 'combat', title: 'during combat · buffs' },
+  { kind: 'debuff', tier: 'combat', title: 'during combat · debuffs' },
+  { kind: 'flat', tier: 'combat', title: 'during combat · flat modifiers' },
+  { kind: 'const', tier: 'combat', title: 'during combat · constants' },
+  { kind: 'flat', tier: 'visible', title: 'flat modifiers' },
+  { kind: 'const', tier: 'flat', title: 'constants' },
+  { kind: 'other', tier: null, title: 'other effects' },
+];
+
+function collectClauses() {
+  const buckets = new Map();
   for (const slot of SLOTS) {
     const skill = skillFor(slot.key);
-    if (!skill || !skill.fx) continue;
-    for (const [kind, target, text, inCombat] of skill.fx.sum || []) {
-      const item = { skill, target, text };
-      if (kind === 'flat') groups.flat.push(item);
-      else if (kind === 'buff') (inCombat ? groups.buffCombat : groups.buff).push(item);
-      else if (kind === 'debuff') (inCombat ? groups.debuffCombat : groups.debuff).push(item);
-      else if (kind === 'const') groups.constant.push(item);
-      else groups.other.push(item);
+    if (!skill) continue;
+    for (const [kind, target, tier, text] of skill.clauses || []) {
+      const key = `${kind}:${kind === 'other' ? '' : tier}`;
+      if (!buckets.has(key)) buckets.set(key, []);
+      buckets.get(key).push({ skill, target, text });
     }
   }
-  return groups;
+  return buckets;
+}
+
+function collectNamedEffects() {
+  const byId = new Map();
+  for (const slot of SLOTS) {
+    const skill = skillFor(slot.key);
+    if (!skill) continue;
+    for (const effect of skill.named_effects) {
+      if (!byId.has(effect)) byId.set(effect, []);
+      byId.get(effect).push(skill.name);
+    }
+  }
+  return byId;
 }
 
 function fxList(items) {
@@ -472,36 +621,55 @@ function fxGroup(title, items, modifier = '') {
     </div>`;
 }
 
+function renderNamedEffects(byId) {
+  const groups = new Map(data.catalog.groups.map((group) => [group.id, []]));
+  for (const [effect, sources] of byId) {
+    const meta = data.effectById.get(effect);
+    if (!meta) continue;
+    if (!groups.has(meta.group)) groups.set(meta.group, []);
+    groups.get(meta.group).push({ meta, sources });
+  }
+  const blocks = [];
+  for (const [groupId, entries] of groups) {
+    if (!entries.length) continue;
+    const groupLabel = data.catalog.groups.find((group) => group.id === groupId)?.label || groupId;
+    blocks.push(`
+      <div class="named-group">
+        <h4>${esc(groupLabel)}</h4>
+        <ul class="named-list">
+          ${entries.sort((a, b) => a.meta.label.localeCompare(b.meta.label, 'en')).map(({ meta, sources }) => `
+            <li>
+              <span class="named-chip" title="${esc(meta.desc)}">${esc(meta.label)}</span>
+              <span class="named-src">${esc([...new Set(sources)].join(', '))}</span>
+            </li>`).join('')}
+        </ul>
+      </div>`);
+  }
+  return blocks.join('');
+}
+
 function renderEffects() {
   const host = $('effects');
-  const groups = collectEffects();
-  const chosen = selectedSkills().length;
-  const total = Object.values(groups).reduce((sum, list) => sum + list.length, 0);
-
-  $('effect-note').textContent = chosen ? `${chosen} skill${chosen === 1 ? '' : 's'} · ${total} effects` : '';
-
-  if (!chosen) {
-    host.innerHTML = '<p class="empty-note">Select a <strong>weapon</strong>, <strong>special</strong> or passive to see its wording sorted into buffs, debuffs, flat modifiers and constants.</p>';
+  const chosen = selectedSkills();
+  if (!chosen.length) {
+    $('effect-note').textContent = '';
+    host.innerHTML = '<p class="empty-note">Select a <strong>weapon</strong>, <strong>special</strong> or passive to see its named effects and the wording split into field, flat and in-combat modifiers.</p>';
     return;
   }
 
-  const combatCount = groups.buffCombat.length + groups.debuffCombat.length;
-  const html = [
-    fxGroup('flat modifier', groups.flat),
-    fxGroup('buffs', groups.buff),
-    fxGroup('debuffs', groups.debuff),
-    combatCount
-      ? `<div class="fx-group fx-group--combat">
-           <h3>during combat <span class="count">${combatCount}</span></h3>
-           ${groups.buffCombat.length ? `<div class="fx-sub"><h4>buffs</h4>${fxList(groups.buffCombat)}</div>` : ''}
-           ${groups.debuffCombat.length ? `<div class="fx-sub"><h4>debuffs</h4>${fxList(groups.debuffCombat)}</div>` : ''}
-         </div>`
-      : '',
-    fxGroup('constants', groups.constant),
-    fxGroup('other effects', groups.other),
-  ].join('');
+  const buckets = collectClauses();
+  const named = collectNamedEffects();
+  const totalClauses = [...buckets.values()].reduce((sum, list) => sum + list.length, 0);
+  $('effect-note').textContent = `${chosen.length} skill${chosen.length === 1 ? '' : 's'} · ${named.size} named effect${named.size === 1 ? '' : 's'} · ${totalClauses} clauses`;
 
-  host.innerHTML = html || '<p class="empty-note">These skills carry no parsed effect lines — open their in-game description for exact wording.</p>';
+  const clauseHtml = CLAUSE_GROUPS.map((group) => {
+    const key = `${group.kind}:${group.tier ?? ''}`;
+    return fxGroup(group.title, buckets.get(key) || [], group.tier === 'combat' ? 'fx-group--combat' : '');
+  }).join('');
+
+  host.innerHTML = `
+    ${named.size ? `<div class="fx-group"><h3>named effects <span class="count">${named.size}</span></h3>${renderNamedEffects(named)}</div>` : ''}
+    ${clauseHtml || '<p class="empty-note">These skills carry no parsed effect lines — open their in-game description for exact wording.</p>'}`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -509,44 +677,38 @@ function renderEffects() {
 /* ------------------------------------------------------------------ */
 
 function accumulate() {
-  const ally = {};
-  const foe = {};
-  for (const stat of STATS) {
-    ally[stat] = [0, 0];
-    foe[stat] = [0, 0];
+  // { ally: { stat: { tier: value } }, foe: { stat: { tier: value } } }
+  const totals = { ally: {}, foe: {} };
+  for (const side of ['ally', 'foe']) {
+    for (const stat of STATS) totals[side][stat] = {};
   }
   for (const skill of selectedSkills()) {
-    const fx = skill.fx || {};
-    for (const [stat, values] of Object.entries(fx.a || {})) {
-      if (!ally[stat]) ally[stat] = [0, 0];
-      ally[stat][0] += values[0] || 0;
-      ally[stat][1] += values[1] || 0;
-    }
-    for (const [stat, values] of Object.entries(fx.f || {})) {
-      if (!foe[stat]) foe[stat] = [0, 0];
-      foe[stat][0] += values[0] || 0;
-      foe[stat][1] += values[1] || 0;
+    for (const [key, value] of Object.entries(skill.flat_modifiers || {})) {
+      const { side, tier, stat } = statKey(key);
+      if (!totals[side][stat]) totals[side][stat] = {};
+      totals[side][stat][tier] = (totals[side][stat][tier] || 0) + value;
     }
   }
-  return { ally, foe };
+  return totals;
 }
 
-function breakdown(values) {
-  const [visible, combat] = values;
-  const parts = [];
-  if (visible) parts.push(`${visible} visible`);
-  if (combat) parts.push(`${combat} combat`);
-  return parts.join(' · ');
+function tierBreakdown(byTier) {
+  return TIERS
+    .filter((tier) => byTier[tier.id])
+    .map((tier) => `<span class="tier-chip tier-chip--${tier.id}" title="${esc(tier.hint)}">${signed(byTier[tier.id])} ${tier.label}</span>`)
+    .join('');
+}
+
+function tierTotal(byTier) {
+  return Object.values(byTier).reduce((sum, value) => sum + value, 0);
 }
 
 function renderConstants() {
-  const { ally, foe } = accumulate();
+  const totals = accumulate();
   const host = $('targets');
-  const totalSP = selectedSkills().reduce((sum, skill) => sum + (skill.sp || 0), 0);
-  const filled = selectedSkills().length;
-  $('sp-note').textContent = filled ? `${filled}/${SLOTS.length} slots · ${totalSP} SP` : `${SLOTS.length} slots`;
-
-  const any = STATS.some((stat) => ally[stat][0] + ally[stat][1] + foe[stat][0] + foe[stat][1] > 0);
+  const chosen = selectedSkills();
+  const totalSP = chosen.reduce((sum, skill) => sum + (skill.sp || 0), 0);
+  $('sp-note').textContent = chosen.length ? `${chosen.length}/${SLOTS.length} slots · ${totalSP} SP` : `${SLOTS.length} slots`;
 
   host.innerHTML = `
     <div class="targets-head">
@@ -555,99 +717,192 @@ function renderConstants() {
       <span class="th-foe">target: foe</span>
     </div>
     ${STATS.map((stat) => {
-      const allyTotal = ally[stat][0] + ally[stat][1];
-      const foeTotal = foe[stat][0] + foe[stat][1];
+      const allyTiers = totals.ally[stat] || {};
+      const foeTiers = totals.foe[stat] || {};
+      const allyTotal = tierTotal(allyTiers);
+      const foeTotal = tierTotal(foeTiers);
       return `
         <div class="stat-cell stat-name">${stat}</div>
-        <div class="stat-cell value ${allyTotal > 0 ? 'is-positive' : 'is-zero'}">
-          ${signed(allyTotal)}${allyTotal ? `<small>${esc(breakdown(ally[stat]))}</small>` : ''}
+        <div class="stat-cell value ${allyTotal > 0 ? 'is-positive' : allyTotal < 0 ? 'is-negative' : 'is-zero'}">
+          <span class="stat-total">${signed(allyTotal)}</span>
+          <span class="tier-stack">${tierBreakdown(allyTiers)}</span>
         </div>
-        <div class="stat-cell value ${foeTotal > 0 ? 'is-negative' : 'is-zero'}">
-          ${foeTotal ? signed(-foeTotal) : '—'}${foeTotal ? `<small>${esc(breakdown(foe[stat]))}</small>` : ''}
+        <div class="stat-cell value ${foeTotal < 0 ? 'is-negative' : foeTotal > 0 ? 'is-positive' : 'is-zero'}">
+          <span class="stat-total">${signed(foeTotal)}</span>
+          <span class="tier-stack">${tierBreakdown(foeTiers)}</span>
         </div>`;
     }).join('')}`;
 
   const net = STATS
-    .map((stat) => ({ stat, swing: ally[stat][0] + ally[stat][1] + foe[stat][0] + foe[stat][1] }))
+    .map((stat) => ({
+      stat,
+      swing: tierTotal(totals.ally[stat] || {}) - tierTotal(totals.foe[stat] || {}),
+    }))
     .filter((row) => row.swing > 0)
     .map((row) => `<span class="net-chip">${row.stat} ${signed(row.swing)} swing</span>`)
     .join('');
 
   $('net-row').innerHTML = net || '<span class="panel-note">No stat bonuses or penalties in this kit yet.</span>';
 
-  $('const-note').textContent = any
-    ? 'Swing = bonuses granted to the unit and allies plus penalties inflicted on the foe. In-combat values only apply during combat.'
-    : 'Visible bonuses and in-combat bonuses are tracked separately, then summed per target.';
+  const hasAny = STATS.some((stat) => tierTotal(totals.ally[stat] || {}) || tierTotal(totals.foe[stat] || {}));
+  $('const-note').innerHTML = hasAny
+    ? 'Each cell splits into <span class="tier-chip tier-chip--phantom">phantom</span> '
+      + '<span class="tier-chip tier-chip--flat">flat</span> '
+      + '<span class="tier-chip tier-chip--visible">visible</span> '
+      + '<span class="tier-chip tier-chip--combat">combat</span>. Foe figures are what the skill does to the opponent&rsquo;s stat line.'
+    : 'Field buffs, flat stat changes and in-combat modifiers are tracked separately, then summed per target.';
 }
 
 /* ------------------------------------------------------------------ */
-/* rendering: suggestions                                              */
+/* rendering: suggestions (synergy engine)                            */
 /* ------------------------------------------------------------------ */
 
-function synergyBetween(tagsA, tagsB) {
-  const hits = [];
-  for (const [a, b, weight, reason] of SYNERGY) {
-    if ((tagsA.includes(a) && tagsB.includes(b)) || (tagsA.includes(b) && tagsB.includes(a))) {
-      hits.push({ weight, reason });
+function modifiersFor(skill, side, stat) {
+  const result = {};
+  for (const [key, value] of Object.entries(skill.flat_modifiers || {})) {
+    const parts = statKey(key);
+    if (parts.side !== side || parts.stat !== stat) continue;
+    if (value > 0) result[parts.tier] = (result[parts.tier] || 0) + value;
+  }
+  return result;
+}
+
+// Provider effects that only make sense when the stat they raise is the stat
+// the other skill actually checks — those are scored by statReasons().
+const STAT_PROVIDERS = new Set([
+  'phantom_stat', 'flat_stat_boost', 'visible_buff_grant',
+  'combat_stat_boost', 'visible_debuff_apply', 'combat_stat_debuff',
+]);
+// Targets scored through the stat line rather than through named effects.
+const STAT_TARGETS = new Set(['stat_comparison']);
+
+function effectReasons(candidate, anchors) {
+  const reasons = [];
+  // Forward: the selected skill needs something, the candidate supplies it.
+  for (const anchor of anchors) {
+    for (const target of anchor.synergy_targets || []) {
+      if (STAT_TARGETS.has(target)) continue;
+      for (const rule of data.catalog.rules[target] || []) {
+        if (STAT_PROVIDERS.has(rule.provider)) continue;
+        if (!candidate.named_effects.includes(rule.provider)) continue;
+        reasons.push({
+          weight: rule.weight,
+          html: `<b>${esc(effectLabel(rule.provider))}</b> — ${esc(rule.rationale)} <span class="why-src">(${esc(anchor.name)})</span>`,
+        });
+      }
     }
   }
-  return hits;
+  // Reverse: the candidate needs something the build already brings.
+  for (const target of candidate.synergy_targets || []) {
+    if (STAT_TARGETS.has(target)) continue;
+    // A skill that already brings the thing it needs does not need a partner.
+    if (candidate.named_effects.includes(target)) continue;
+    for (const rule of data.catalog.rules[target] || []) {
+      if (STAT_PROVIDERS.has(rule.provider)) continue;
+      if (candidate.named_effects.includes(rule.provider)) continue;
+      const anchor = anchors.find((entry) => entry.named_effects.includes(rule.provider));
+      if (!anchor) continue;
+      reasons.push({
+        weight: rule.weight * 0.85,
+        html: `<b>needs ${esc(targetLabel(target))}</b> — ${esc(anchor.name)} already brings ${esc(effectLabel(rule.provider))}`,
+      });
+    }
+  }
+  return reasons;
+}
+
+function statReasonHtml(side, stat, anchorName, value, tier) {
+  const label = tier === 'phantom' ? `Phantom ${stat} ${signed(value)}` : `${signed(value)} ${tier} ${stat}`;
+  const verb = tier === 'phantom' ? 'wins' : 'clears';
+  return {
+    weight: 0,
+    label,
+    html: side === 'forward'
+      ? `<b>${esc(label)}</b> — ${verb} ${esc(anchorName)}'s ${stat} check`
+      : `<b>needs ${stat} for its check</b> — ${esc(anchorName)} brings ${esc(label)}`,
+  };
+}
+
+function statReasons(candidate, anchors) {
+  const reasons = [];
+  const weights = data.catalog.statTierWeights || {};
+  const scored = (tiers, value) => (weights[tiers] || 0) * Math.min(value, 7) / 7 * 2.5;
+
+  for (const anchor of anchors) {
+    // forward: the candidate raises the stat the selected skill checks
+    for (const stat of anchor.check_stats || []) {
+      for (const [tier, value] of Object.entries(modifiersFor(candidate, 'ally', stat))) {
+        const weight = scored(tier, value);
+        if (weight <= 0) continue;
+        reasons.push({ ...statReasonHtml('forward', stat, anchor.name, value, tier), weight });
+      }
+    }
+    // reverse: the candidate checks a stat the build already raises
+    for (const stat of candidate.check_stats || []) {
+      for (const [tier, value] of Object.entries(modifiersFor(anchor, 'ally', stat))) {
+        if (tier === 'combat') continue; // the candidate's check happens before combat
+        const weight = scored(tier, value) * 0.85;
+        if (weight <= 0) continue;
+        reasons.push({ ...statReasonHtml('reverse', stat, anchor.name, value, tier), weight });
+      }
+    }
+  }
+  return reasons;
 }
 
 function rankCandidates(slot, anchors) {
   const taken = new Set(selectedSkills().map((skill) => skill.id));
   const pool = (data.byCat.get(slot.cat) || []).filter((skill) => (
-    !skill.prf && !taken.has(skill.id) && compatible(skill, state.unit)
+    !skill.prf && !taken.has(skill.id) && compatible(skill, state.unit) && passesFilters(skill)
   ));
 
-  // Tags the current build already covers — repeating them adds little.
   const covered = new Set();
-  for (const anchor of anchors) for (const tag of anchor.fx?.tags || []) covered.add(tag);
+  for (const anchor of anchors) for (const effect of anchor.named_effects) covered.add(effect);
 
   // A minimal core matters most: passives before seals, specials before weapons.
   const slotWeight = { passivea: 1.15, passiveb: 1.15, passivec: 1.15, special: 1.05 }[slot.cat] || 1;
 
   const ranked = [];
   for (const skill of pool) {
-    const tags = skill.fx?.tags || [];
-    let score = 0;
-    const reasons = new Map();
-    for (const anchor of anchors) {
-      for (const hit of synergyBetween(tags, anchor.fx?.tags || [])) {
-        score += hit.weight;
-        if (!reasons.has(hit.reason)) reasons.set(hit.reason, anchor.name);
-      }
-    }
-    if (!score) continue;
-    const redundant = tags.filter((tag) => covered.has(tag)).length;
-    score = score * slotWeight - redundant * 0.9;
+    const reasons = [...effectReasons(skill, anchors), ...statReasons(skill, anchors)];
+    if (!reasons.length) continue;
+    const raw = reasons.reduce((sum, reason) => sum + reason.weight, 0);
+    const redundant = skill.named_effects.filter((effect) => covered.has(effect)).length;
+    const score = raw * slotWeight - redundant * 0.9;
     if (score <= 0) continue;
-    ranked.push({ skill, score, reasons });
+    ranked.push({ skill, score, raw, reasons });
   }
 
   ranked.sort((a, b) => b.score - a.score
-    || b.reasons.size - a.reasons.size
+    || b.reasons.length - a.reasons.length
     || (b.skill.sp || 0) - (a.skill.sp || 0)
     || a.skill.name.localeCompare(b.skill.name, 'en'));
 
   return ranked.slice(0, 5);
 }
 
-function renderReasons(reasons) {
-  const entries = [...reasons.entries()];
+function reasonList(reasons) {
   const seen = new Set();
-  const unique = entries.filter(([reason]) => {
-    if (seen.has(reason)) return false;
-    seen.add(reason);
-    return true;
-  });
-  entries.length = 0;
-  entries.push(...unique);
-  const shown = entries.slice(0, 2)
-    .map(([reason, source]) => `${esc(reason)} <span class="why-src">(${esc(source)})</span>`)
-    .join(' · ');
-  const rest = entries.length > 2 ? ` <span class="why-more">+${entries.length - 2} more</span>` : '';
+  const unique = reasons
+    .sort((a, b) => b.weight - a.weight)
+    .filter((reason) => {
+      if (seen.has(reason.html)) return false;
+      seen.add(reason.html);
+      return true;
+    });
+  const shown = unique.slice(0, 2).map((reason) => reason.html).join('<br>');
+  const rest = unique.length > 2 ? ` <span class="why-more">+${unique.length - 2} more</span>` : '';
   return shown + rest;
+}
+
+function effectChips(skill, limit = 3) {
+  const chips = skill.named_effects.slice(0, limit).map((effect) => (
+    `<span class="mini-chip">${esc(effectLabel(effect))}</span>`
+  ));
+  if (skill.named_effects.length > limit) {
+    chips.push(`<span class="mini-chip mini-chip--muted">+${skill.named_effects.length - limit}</span>`);
+  }
+  return chips.join('');
 }
 
 function renderSuggestions() {
@@ -671,9 +926,15 @@ function renderSuggestions() {
   }
 
   const blocks = [];
+  const barren = [];
+  let emptyBecauseFilters = false;
   for (const slot of emptySlots) {
     const ranked = rankCandidates(slot, anchors);
-    if (!ranked.length) continue;
+    if (!ranked.length) {
+      if (hasActiveFilters()) emptyBecauseFilters = true;
+      barren.push(slot.label);
+      continue;
+    }
     blocks.push(`
       <div class="suggest-block">
         <h3>${esc(slot.label)} <span class="pill pill--empty">empty</span></h3>
@@ -685,18 +946,25 @@ function renderSuggestions() {
                   <span class="si-name">${esc(skill.name)}</span>
                   <span class="si-meta">${esc(metaFor(skill))}</span>
                 </span>
-                <span class="si-why">${renderReasons(reasons)}</span>
+                <span class="si-why">${reasonList(reasons)}</span>
+                <span class="si-effects">${effectChips(skill)}</span>
               </button>
             </li>`).join('')}
         </ul>
       </div>`);
   }
 
-  note.textContent = blocks.length ? `based on ${anchors.length} selected skill${anchors.length === 1 ? '' : 's'}` : '';
+  note.textContent = blocks.length
+    ? `${anchors.length} selected skill${anchors.length === 1 ? '' : 's'}${hasActiveFilters() ? ' · filters on' : ''}`
+    : '';
 
-  host.innerHTML = blocks.join('') || `<p class="empty-note">
-    No obvious complements for the remaining slots yet. Add one more skill, or pick a slot manually —
-    the list is limited to skills this hero can actually inherit.</p>`;
+  const barrenNote = blocks.length && barren.length
+    ? `<p class="empty-note barren-note">No direct synergy found for ${barren.length === 1 ? '' : 'the '}${esc(barren.join(', '))} slot${barren.length === 1 ? '' : 's'} — pick from the full list, or add another skill to widen the search.</p>`
+    : '';
+
+  host.innerHTML = (blocks.join('') + barrenNote) || `<p class="empty-note">${emptyBecauseFilters
+    ? 'No candidate skill matches the active filters. <button type="button" class="link-button" data-clear-filters>Clear filters</button> to widen the list.'
+    : `No obvious complements for the remaining slots yet. Add one more skill, or pick a slot manually — the list is limited to skills this hero can actually inherit.`}</p>`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -754,7 +1022,17 @@ function readHash() {
   for (const slot of SLOTS) {
     const id = params.get(slot.key);
     const skill = id ? data.skillById.get(id) : null;
-    state.picks[slot.key] = skill && compatible(skill, state.unit) ? skill.id : null;
+    if (skill) {
+      state.picks[slot.key] = compatible(skill, state.unit) ? skill.id : null;
+    } else if (!params.has(slot.key) && state.unit) {
+      // Slots missing from the hash fall back to the hero's default kit.
+      const kitSkill = state.unit.kit?.[slot.cat]
+        ? data.skillById.get(state.unit.kit[slot.cat])
+        : null;
+      state.picks[slot.key] = kitSkill && compatible(kitSkill, state.unit) ? kitSkill.id : null;
+    } else {
+      state.picks[slot.key] = null;
+    }
   }
   return Boolean(state.unit || selectedSkills().length);
 }
@@ -763,24 +1041,34 @@ function readHash() {
 /* boot                                                                */
 /* ------------------------------------------------------------------ */
 
+function fetchJson(path) {
+  return fetch(path).then((res) => {
+    if (!res.ok) throw new Error(`${path} → HTTP ${res.status}`);
+    return res.json();
+  });
+}
+
 async function loadData() {
-  const [skills, units] = await Promise.all([
-    fetch('data/skills.json').then((res) => {
-      if (!res.ok) throw new Error(`skills.json → HTTP ${res.status}`);
-      return res.json();
-    }),
-    fetch('data/units.json').then((res) => {
-      if (!res.ok) throw new Error(`units.json → HTTP ${res.status}`);
-      return res.json();
-    }),
+  const [skills, units, catalog] = await Promise.all([
+    fetchJson('data/skills.json'),
+    fetchJson('data/units.json'),
+    fetchJson('data/effects.json'),
   ]);
 
   data.skills = skills;
   data.units = units;
+  data.catalog = catalog;
+
+  for (const effect of [...catalog.effects, ...catalog.targets]) {
+    data.effectById.set(effect.id, effect);
+  }
   for (const skill of skills) {
     data.skillById.set(skill.id, skill);
     if (!data.byCat.has(skill.cat)) data.byCat.set(skill.cat, []);
     data.byCat.get(skill.cat).push(skill);
+    for (const effect of skill.named_effects) {
+      data.effectCounts.set(effect, (data.effectCounts.get(effect) || 0) + 1);
+    }
   }
   for (const unit of units) data.unitById.set(unit.id, unit);
   data.loaded = true;
@@ -788,15 +1076,28 @@ async function loadData() {
 
 function bindStaticEvents() {
   $('suggestions').addEventListener('click', (event) => {
+    if (event.target.closest('[data-clear-filters]')) {
+      Object.values(state.filters).forEach((set) => set.clear());
+      renderFilters();
+      syncSlotOptions();
+      refresh();
+      return;
+    }
     const button = event.target.closest('.suggest-item');
     if (!button) return;
     const { slot, id } = button.dataset;
     if (!slot || !combos[slot]) return;
     combos[slot].setValue(id, { silent: false });
   });
+
+  bindFilterEvents();
 }
 
+let booted = false;
+
 async function init() {
+  if (booted) return;
+  booted = true;
   renderSlotsPlaceholder();
 
   try {
@@ -817,6 +1118,7 @@ async function init() {
   combos.character.setOptions(buildCharacterOptions());
 
   renderSlots();
+  renderFilters();
   bindStaticEvents();
 
   if (readHash()) {

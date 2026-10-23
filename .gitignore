@@ -1,0 +1,7 @@
+# raw data export — clone it with:
+#   git clone https://github.com/matxx/feh-data feh-data
+/feh-data/
+
+# python
+__pycache__/
+*.pyc
