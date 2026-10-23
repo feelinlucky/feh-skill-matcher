@@ -44,6 +44,12 @@ import json
 import re
 from pathlib import Path
 
+from meta_rules import (
+    SP_FLOORS,
+    is_recommendable,
+    policy,
+    version_score,
+)
 from effects_catalog import (
     CHECK_STAT_PATTERNS,
     EFFECTS,
@@ -543,7 +549,25 @@ def clean_name(name: str) -> str:
     return re.sub(r"\s+", " ", name or "").strip()
 
 
-def build(source: Path, out_dir: Path) -> None:
+def prune_legacy(skills: list[dict], keep_ids: set[str]) -> tuple[list[dict], int]:
+    """Drop legacy entries that can never surface.
+
+    A skill is kept when it is recommendable, when it is unit-exclusive (hero
+    default kits and the hero's own prf skills point at those ids), or when a
+    hero's default kit references it. Everything else is a prerequisite or a
+    below-floor legacy skill that the UI filters out anyway.
+    """
+    kept: list[dict] = []
+    dropped = 0
+    for skill in skills:
+        if skill["recommendable"] or skill["exclusive"] or skill["id"] in keep_ids:
+            kept.append(skill)
+        else:
+            dropped += 1
+    return kept, dropped
+
+
+def build(source: Path, out_dir: Path, keep_legacy: bool = False) -> None:
     skills_raw = load(source / "skills.json")
     try:
         descriptions = {row["id"]: row for row in load(source / "skills-descriptions.json")}
@@ -562,6 +586,14 @@ def build(source: Path, out_dir: Path) -> None:
         if base:
             refines_of.setdefault(base, []).append(row["id"])
 
+    # Progression graph. A skill that upgrades into something else is a
+    # prerequisite (Fury 3 -> Fury 4) and never worth recommending on its own.
+    upgrades_of: dict[str, list[str]] = {}
+    for row in skills_raw:
+        children = [child for child in row.get("upgrade_ids") or [] if child in raw_by_id]
+        if children:
+            upgrades_of[row["id"]] = children
+
     skills: list[dict] = []
     by_id: dict[str, dict] = {}
 
@@ -579,18 +611,25 @@ def build(source: Path, out_dir: Path) -> None:
         cd = raw.get("cd")
 
         analysis = analyse_skill(desc, category, cd, clean_name(raw.get("name")))
+        is_sub_tier = bool(upgrades_of.get(raw["id"]))
+        sp = raw.get("sp")
         entry = {
             "id": raw["id"],
             "name": clean_name(raw.get("name")),
             "slot": SLOT_BY_CATEGORY[category],
             "cat": category,
-            "sp": raw.get("sp"),
+            "sp": sp,
             "tier": raw.get("tier"),
+            "ver": version_score(raw.get("version")),
             "wt": raw.get("weapon_type"),
             "cd": cd,
             "mt": raw.get("might"),
             "rng": raw.get("range"),
             "prf": is_prf,
+            "exclusive": is_prf,
+            "max_tier": not is_sub_tier,
+            "is_sub_tier": is_sub_tier,
+            "recommendable": is_recommendable(category, sp, is_prf, is_sub_tier),
             "res": restricted,
             "desc": desc,
             "named_effects": analysis["named_effects"],
@@ -641,13 +680,22 @@ def build(source: Path, out_dir: Path) -> None:
         })
     units.sort(key=lambda u: u["name"].lower())
 
+    dropped = 0
+    if not keep_legacy:
+        referenced = {value[0] for kit_slots in kit.values() for value in kit_slots.values()}
+        skills, dropped = prune_legacy(skills, referenced)
+
     out_dir.mkdir(parents=True, exist_ok=True)
     write_json(out_dir / "skills.json", skills)
     write_json(out_dir / "units.json", units)
     write_json(out_dir / "effects.json", catalog())
+    write_json(out_dir / "meta.json", policy(pruned=not keep_legacy))
 
     print(f"skills: {len(skills)}  units: {len(units)}")
-    for name in ("skills.json", "units.json", "effects.json"):
+    if dropped:
+        print(f"  pruned {dropped} legacy entries (prerequisites / below SP floor, "
+              f"not referenced by any default kit)")
+    for name in ("skills.json", "units.json", "effects.json", "meta.json"):
         path = out_dir / name
         print(f"  {path}  {path.stat().st_size / 1024:.0f} KiB")
     report(skills)
@@ -670,6 +718,16 @@ def report(skills: list[dict]) -> None:
     for target, count in sorted(targets.items()):
         print(f"  {count:5d}  {target}")
 
+    slots: dict[str, list[int]] = {}
+    for skill in skills:
+        row = slots.setdefault(skill["slot"], [0, 0, 0])
+        row[0] += 1
+        row[1] += 1 if skill["recommendable"] else 0
+        row[2] += 1 if skill["exclusive"] else 0
+    print("\nper slot: total / recommendable / exclusive")
+    for slot, (total, recommendable, exclusive) in slots.items():
+        print(f"  {slot:8s} {total:5d} / {recommendable:5d} / {exclusive:5d}")
+
 
 def write_json(path: Path, payload) -> None:
     with path.open("w", encoding="utf-8") as fh:
@@ -681,6 +739,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=root / "feh-data" / "data")
     parser.add_argument("--out", type=Path, default=root / "data")
+    parser.add_argument(
+        "--keep-legacy",
+        action="store_true",
+        help="also write prerequisite / below-floor skills (flagged, never recommended)",
+    )
     args = parser.parse_args()
     if not (args.source / "skills.json").exists():
         raise SystemExit(
@@ -689,7 +752,7 @@ def main() -> None:
             "  git clone https://github.com/matxx/feh-data feh-data\n"
             "or pass --source /path/to/feh-data/data"
         )
-    build(args.source, args.out)
+    build(args.source, args.out, keep_legacy=args.keep_legacy)
 
 
 if __name__ == "__main__":

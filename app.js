@@ -32,6 +32,18 @@ const TIERS = [
 
 const MOVE_TYPES = ['Infantry', 'Armored', 'Cavalry', 'Flying'];
 
+// Display labels per data category, used by the scope note.
+const SLOT_BY_CAT = {
+  weapon: 'weapon',
+  assist: 'assist',
+  special: 'special',
+  passivea: 'A',
+  passiveb: 'B',
+  passivec: 'C',
+  passivex: 'X',
+  sacredseal: 'seal',
+};
+
 const WEAPON_GROUPS = [
   { id: 'sword', label: 'sword', match: /Sword/ },
   { id: 'lance', label: 'lance', match: /Lance/ },
@@ -61,6 +73,23 @@ function signed(n) {
   return n > 0 ? `+${n}` : `\u2212${Math.abs(n)}`;
 }
 
+function versionLabel(score) {
+  if (score === null || score === undefined) return '';
+  return `${Math.floor(score / 100)}.${score % 100}`;
+}
+
+function spFloor(cat) {
+  return data.meta?.spFloors?.[cat] ?? 0;
+}
+
+// Top-tier, inheritable skills only. The build already marks each entry, but
+// fall back to the policy so a stale data file cannot leak legacy skills.
+function isRecommendable(skill) {
+  if (typeof skill.recommendable === 'boolean') return skill.recommendable;
+  if (skill.exclusive || skill.prf) return false;
+  return (skill.sp || 0) >= spFloor(skill.cat);
+}
+
 function normalize(text) {
   return String(text ?? '').toLowerCase().replace(/[\u2019']/g, "'");
 }
@@ -80,6 +109,7 @@ function statKey(key) {
 const data = {
   skills: [],
   units: [],
+  meta: { spFloors: {}, floorNotes: {}, rules: {}, pruned: false },
   catalog: { effects: [], targets: [], rules: {}, groups: [], statTierWeights: {} },
   effectById: new Map(),
   skillById: new Map(),
@@ -93,6 +123,8 @@ const state = {
   unit: null,
   picks: Object.fromEntries(SLOTS.map((slot) => [slot.key, null])),
   filters: { moves: new Set(), weapons: new Set(), effects: new Set() },
+  // Legacy / prf skills are hidden from every list unless this is switched on.
+  showLegacy: false,
 };
 
 const combos = {};
@@ -142,7 +174,7 @@ function tokenMatchesGroup(token, groupId) {
 }
 
 function compatible(skill, unit) {
-  if (skill.prf) return Boolean(unit && unit.prf && unit.prf.includes(skill.id));
+  if (skill.exclusive) return Boolean(unit && unit.prf && unit.prf.includes(skill.id));
   if (!unit) return true;
   const res = skill.res || {};
   const moves = res.moves || {};
@@ -155,7 +187,7 @@ function compatible(skill, unit) {
 }
 
 function skillAllowsMove(skill, move) {
-  if (skill.prf) return Boolean(state.unit && state.unit.mv === move);
+  if (skill.exclusive) return Boolean(state.unit && state.unit.mv === move);
   const res = skill.res?.moves || {};
   if (res.can_use && !res.can_use.includes(move)) return false;
   if (res.can_not_use && res.can_not_use.includes(move)) return false;
@@ -163,7 +195,7 @@ function skillAllowsMove(skill, move) {
 }
 
 function skillAllowsWeaponGroup(skill, groupId) {
-  if (skill.prf) {
+  if (skill.exclusive) {
     return Boolean(state.unit && WEAPON_GROUPS.find((g) => g.id === groupId)?.match.test(state.unit.wt || ''));
   }
   const res = skill.res?.weapons || {};
@@ -403,6 +435,13 @@ function metaFor(skill) {
   return skill.sp ? `${skill.sp} SP` : '';
 }
 
+// "300 SP · cd 3 · v10.4", skipping empty parts.
+function metaLine(skill) {
+  return [metaFor(skill), skill.ver ? `v${versionLabel(skill.ver)}` : '']
+    .filter(Boolean)
+    .join(' · ');
+}
+
 function displayName(skill) {
   if (!skill.refine) return skill.name;
   return `${skill.name} · refine ${skill.refine === 'skill1' ? '1' : '2'}`;
@@ -411,28 +450,40 @@ function displayName(skill) {
 function badgesFor(skill, unit) {
   const badges = [];
   if (unit && unit.kit && Object.values(unit.kit).includes(skill.id)) badges.push('base kit');
-  if (skill.prf) badges.push('prf');
+  if (skill.exclusive) badges.push('prf');
   if (skill.refine) badges.push('refine variant');
+  if (!skill.exclusive && skill.is_sub_tier) badges.push('prerequisite');
+  if (!skill.exclusive && !skill.is_sub_tier && !isRecommendable(skill)) badges.push('legacy tier');
   return badges.join(' · ');
+}
+
+// Highest SP first, then newest release, then name — the same ordering the
+// recommender uses.
+function compareMeta(a, b) {
+  return (b.sp || 0) - (a.sp || 0)
+    || (b.ver || 0) - (a.ver || 0)
+    || a.name.localeCompare(b.name, 'en');
 }
 
 function buildOptions(slot) {
   const pool = data.byCat.get(slot.cat) || [];
+  // A skill already chosen (or loaded from a hero's kit) must stay selectable
+  // even when it is legacy or prf, otherwise the field cannot render it.
+  const keepIds = new Set(selectedSkills().map((skill) => skill.id));
+  if (state.unit) Object.values(state.unit.kit || {}).forEach((id) => keepIds.add(id));
+
   return pool
     .filter((skill) => compatible(skill, state.unit) && passesFilters(skill))
+    .filter((skill) => state.showLegacy || isRecommendable(skill) || keepIds.has(skill.id))
+    .sort(compareMeta)
     .map((skill) => ({
       id: skill.id,
       label: displayName(skill),
       meta: metaFor(skill),
       shortMeta: skill.sp ? `${skill.sp} SP` : '',
       note: badgesFor(skill, state.unit),
-      refine: skill.refine || null,
-      keywords: skill.named_effects.join(' '),
-    }))
-    // Base skills first so the opening list is not a wall of refine variants.
-    .sort((a, b) => (a.refine ? 1 : 0) - (b.refine ? 1 : 0)
-      || a.label.localeCompare(b.label, 'en')
-      || String(a.meta).localeCompare(String(b.meta)));
+      keywords: [...skill.named_effects, skill.refine ? 'refine' : ''].join(' '),
+    }));
 }
 
 function buildCharacterOptions() {
@@ -515,10 +566,30 @@ function renderFilters() {
       || a.label.localeCompare(b.label, 'en'))
     .map((effect) => ({ id: effect.id, label: `${effect.label} (${data.effectCounts.get(effect.id)})` }));
 
+  const floors = data.meta?.spFloors || {};
+  const floorList = Object.entries(floors)
+    .filter(([cat, value]) => value > 0 && SLOT_BY_CAT[cat])
+    .map(([cat, value]) => `${SLOT_BY_CAT[cat]} ${value}+`)
+    .join(' · ');
+
   $('filters').innerHTML = [
     chipGroup('movement', MOVE_TYPES.map((move) => ({ id: move, label: move })), moves, 'moves'),
     chipGroup('weapon', WEAPON_GROUPS.map((group) => ({ id: group.id, label: group.label })), weapons, 'weapons'),
     chipGroup('grants named effect', effectItems, effects, 'effects'),
+    `<div class="filter-group">
+       <h3>list scope</h3>
+       <div class="filter-chips">
+         <label class="chip chip--toggle ${state.showLegacy ? 'is-on' : ''}">
+           <input type="checkbox" data-toggle="showLegacy" ${state.showLegacy ? 'checked' : ''}>
+           <span>include prf &amp; off-meta</span>
+         </label>
+       </div>
+       <p class="filter-scope-note">
+         Lists are limited to top-tier inheritables — no prf, no prerequisites, and
+         ${esc(floorList)} SP by slot. The switch also reveals unit-exclusive skills and the
+         legacy skills a hero already ships with; suggestions stay top-tier either way.
+       </p>
+     </div>`,
   ].join('');
 
   updateFilterStatus();
@@ -526,7 +597,8 @@ function renderFilters() {
 
 function updateFilterStatus() {
   const count = activeFilterCount();
-  $('filter-note').textContent = count ? `${count} active` : 'none';
+  const scope = state.showLegacy ? 'off-meta' : 'top-tier';
+  $('filter-note').textContent = count ? `${count} active · ${scope}` : scope;
   $('filter-clear').disabled = count === 0;
   $('filters').classList.toggle('has-active', count > 0);
 }
@@ -538,6 +610,15 @@ function activeFilterCount() {
 
 function bindFilterEvents() {
   $('filters').addEventListener('change', (event) => {
+    const toggle = event.target.closest('input[data-toggle]');
+    if (toggle) {
+      state[toggle.dataset.toggle] = toggle.checked;
+      toggle.closest('.chip')?.classList.toggle('is-on', toggle.checked);
+      updateFilterStatus();
+      syncSlotOptions();
+      refresh();
+      return;
+    }
     const input = event.target.closest('input[data-filter]');
     if (!input) return;
     const set = state.filters[input.dataset.filter];
@@ -850,10 +931,15 @@ function statReasons(candidate, anchors) {
   return reasons;
 }
 
+const RELEVANCE_KEEP = 0.6;
+
 function rankCandidates(slot, anchors) {
   const taken = new Set(selectedSkills().map((skill) => skill.id));
   const pool = (data.byCat.get(slot.cat) || []).filter((skill) => (
-    !skill.prf && !taken.has(skill.id) && compatible(skill, state.unit) && passesFilters(skill)
+    isRecommendable(skill)                       // never prf, never a prerequisite
+    && !taken.has(skill.id)                      // never offer a skill already equipped
+    && compatible(skill, state.unit)
+    && passesFilters(skill)
   ));
 
   const covered = new Set();
@@ -873,12 +959,25 @@ function rankCandidates(slot, anchors) {
     ranked.push({ skill, score, raw, reasons });
   }
 
-  ranked.sort((a, b) => b.score - a.score
-    || b.reasons.length - a.reasons.length
-    || (b.skill.sp || 0) - (a.skill.sp || 0)
-    || a.skill.name.localeCompare(b.skill.name, 'en'));
+  if (!ranked.length) return [];
 
-  return ranked.slice(0, 5);
+  // Relevance decides *which* skills qualify; the meta order decides how they
+  // are listed. Keeping the strong matches (at least 60% of the best score)
+  // and then sorting by SP desc, version desc, name asc means the five cards
+  // are always top-tier first instead of drifting on score noise.
+  const best = Math.max(...ranked.map((row) => row.score));
+  const strong = ranked.filter((row) => row.score >= best * RELEVANCE_KEEP);
+  const fillers = ranked.filter((row) => row.score < best * RELEVANCE_KEEP);
+
+  // Thin slots (X echoes, seals) can leave the shortlist empty, so pad with the
+  // next-best matches rather than showing an incomplete list.
+  const need = Math.max(0, 5 - strong.length);
+  const order = (a, b) => (b.skill.sp || 0) - (a.skill.sp || 0)
+    || (b.skill.ver || 0) - (a.skill.ver || 0)
+    || a.skill.name.localeCompare(b.skill.name, 'en');
+
+  const chosen = strong.concat(fillers.slice(0, need));
+  return chosen.sort(order).slice(0, 5);
 }
 
 function reasonList(reasons) {
@@ -944,7 +1043,7 @@ function renderSuggestions() {
               <button type="button" class="suggest-item" data-slot="${esc(slot.key)}" data-id="${esc(skill.id)}">
                 <span class="si-top">
                   <span class="si-name">${esc(skill.name)}</span>
-                  <span class="si-meta">${esc(metaFor(skill))}</span>
+                  <span class="si-meta">${esc(metaLine(skill))}</span>
                 </span>
                 <span class="si-why">${reasonList(reasons)}</span>
                 <span class="si-effects">${effectChips(skill)}</span>
@@ -955,7 +1054,7 @@ function renderSuggestions() {
   }
 
   note.textContent = blocks.length
-    ? `${anchors.length} selected skill${anchors.length === 1 ? '' : 's'}${hasActiveFilters() ? ' · filters on' : ''}`
+    ? `top-tier inheritable · ${anchors.length} selected skill${anchors.length === 1 ? '' : 's'}${hasActiveFilters() ? ' · filters on' : ''}`
     : '';
 
   const barrenNote = blocks.length && barren.length
@@ -1049,15 +1148,17 @@ function fetchJson(path) {
 }
 
 async function loadData() {
-  const [skills, units, catalog] = await Promise.all([
+  const [skills, units, catalog, meta] = await Promise.all([
     fetchJson('data/skills.json'),
     fetchJson('data/units.json'),
     fetchJson('data/effects.json'),
+    fetchJson('data/meta.json').catch(() => null),
   ]);
 
   data.skills = skills;
   data.units = units;
   data.catalog = catalog;
+  if (meta) data.meta = meta;
 
   for (const effect of [...catalog.effects, ...catalog.targets]) {
     data.effectById.set(effect.id, effect);
