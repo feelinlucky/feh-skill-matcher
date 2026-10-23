@@ -123,6 +123,8 @@ const state = {
   unit: null,
   picks: Object.fromEntries(SLOTS.map((slot) => [slot.key, null])),
   filters: { moves: new Set(), weapons: new Set(), effects: new Set() },
+  // Weapon type + movement type stand-in for "my unit" when no hero is picked.
+  archetype: { weapon: '', move: '' },
   // Legacy / prf skills are hidden from every list unless this is switched on.
   showLegacy: false,
 };
@@ -183,6 +185,42 @@ function compatible(skill, unit) {
   if (moves.can_not_use && moves.can_not_use.includes(unit.mv)) return false;
   if (weapons.can_use && !weapons.can_use.some((token) => tokenMatches(token, unit.wt))) return false;
   if (weapons.can_not_use && weapons.can_not_use.some((token) => tokenMatches(token, unit.wt))) return false;
+  return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* step 1: strict compatibility / inheritability                      */
+/* ------------------------------------------------------------------ */
+
+// Which unit context the candidate pool is built for: a concrete hero, a
+// weapon+movement archetype, or "everything" when neither is set.
+function unitScope() {
+  if (state.unit) return 'hero';
+  if (state.archetype.weapon || state.archetype.move) return 'archetype';
+  return 'none';
+}
+
+function hasArchetype() {
+  return unitScope() === 'archetype';
+}
+
+// A skill may be *recommended* only when the scoped unit can legally equip it:
+// weapon-type restriction, movement-type restriction, and no unit-exclusive
+// skill unless the hero actually owns it.
+function inheritable(skill) {
+  const scope = unitScope();
+  if (skill.exclusive) {
+    if (scope === 'hero') return Boolean(state.unit.prf && state.unit.prf.includes(skill.id));
+    // Browsing only: prf skills belong to some other hero.
+    return scope === 'none' ? state.showLegacy : false;
+  }
+  if (scope === 'hero') return compatible(skill, state.unit);
+  if (scope === 'archetype') {
+    const { weapon, move } = state.archetype;
+    if (weapon && !skillAllowsWeaponGroup(skill, weapon)) return false;
+    if (move && !skillAllowsMove(skill, move)) return false;
+    return true;
+  }
   return true;
 }
 
@@ -473,7 +511,7 @@ function buildOptions(slot) {
   if (state.unit) Object.values(state.unit.kit || {}).forEach((id) => keepIds.add(id));
 
   return pool
-    .filter((skill) => compatible(skill, state.unit) && passesFilters(skill))
+    .filter((skill) => inheritable(skill) && passesFilters(skill))
     .filter((skill) => state.showLegacy || isRecommendable(skill) || keepIds.has(skill.id))
     .sort(compareMeta)
     .map((skill) => ({
@@ -528,6 +566,16 @@ function renderCharacter() {
   const unit = state.unit;
   const meta = $('character-meta');
   if (!unit) {
+    if (hasArchetype()) {
+      const weapon = WEAPON_GROUPS.find((group) => group.id === state.archetype.weapon);
+      const tags = [
+        weapon ? `<span class="tag tag--accent">${esc(weapon.label)} archetype</span>` : '',
+        state.archetype.move ? `<span class="tag tag--accent">${esc(state.archetype.move)}</span>` : '',
+        '<span class="tag">no hero — inheritable sets shown</span>',
+      ].filter(Boolean).join('');
+      meta.innerHTML = tags;
+      return;
+    }
     meta.innerHTML = '<span class="tag">no hero selected — every compatible skill is listed</span>';
     return;
   }
@@ -572,7 +620,27 @@ function renderFilters() {
     .map(([cat, value]) => `${SLOT_BY_CAT[cat]} ${value}+`)
     .join(' · ');
 
+  const archetypeSelect = (kind, label, items) => `
+    <label class="archetype-field">
+      <span>${esc(label)}</span>
+      <select data-archetype="${kind}" aria-label="archetype ${esc(label)}">
+        <option value="" ${state.archetype[kind] ? '' : 'selected'}>any</option>
+        ${items.map((item) => `<option value="${esc(item.id)}" ${state.archetype[kind] === item.id ? 'selected' : ''}>${esc(item.label)}</option>`).join('')}
+      </select>
+    </label>`;
+
   $('filters').innerHTML = [
+    `<div class="filter-group">
+       <h3>unit archetype</h3>
+       <div class="archetype-grid">
+         ${archetypeSelect('weapon', 'weapon', WEAPON_GROUPS)}
+         ${archetypeSelect('move', 'movement', MOVE_TYPES.map((move) => ({ id: move, label: move })))}
+       </div>
+       <p class="filter-scope-note">
+         With no hero selected, these two fields stand in for the unit: only skills this
+         weapon + movement can inherit are scored${state.unit ? ' (a selected hero overrides them)' : ''}.
+       </p>
+     </div>`,
     chipGroup('movement', MOVE_TYPES.map((move) => ({ id: move, label: move })), moves, 'moves'),
     chipGroup('weapon', WEAPON_GROUPS.map((group) => ({ id: group.id, label: group.label })), weapons, 'weapons'),
     chipGroup('grants named effect', effectItems, effects, 'effects'),
@@ -619,6 +687,17 @@ function bindFilterEvents() {
       refresh();
       return;
     }
+    const select = event.target.closest('select[data-archetype]');
+    if (select) {
+      state.archetype[select.dataset.archetype] = select.value;
+      // A hero and an archetype are two ways of answering the same question;
+      // picking an archetype drops the hero so the scopes cannot disagree.
+      if (state.unit) applyUnit(null);
+      syncSlotOptions();
+      refresh();
+      return;
+    }
+
     const input = event.target.closest('input[data-filter]');
     if (!input) return;
     const set = state.filters[input.dataset.filter];
@@ -931,53 +1010,192 @@ function statReasons(candidate, anchors) {
   return reasons;
 }
 
-const RELEVANCE_KEEP = 0.6;
+/* ------------------------------------------------------------------ */
+/* step 2: max-condition output score                                 */
+/* ------------------------------------------------------------------ */
 
+const outputCache = new Map();
+
+// data/skills.json stores `output` as { ally|foe: { atk: {visible,flat,combat} },
+// true_damage: {flat, pct:[{stat,value}]}, dr }. Normalise the stat casing once.
+function normaliseOutput(skill) {
+  const cached = outputCache.get(skill.id);
+  if (cached) return cached;
+
+  const raw = skill.output || {};
+  const out = { ally: {}, foe: {}, trueFlat: 0, truePct: [], dr: raw.dr || 0 };
+  for (const side of ['ally', 'foe']) {
+    for (const [stat, tiers] of Object.entries(raw[side] || {})) {
+      const name = stat.charAt(0).toUpperCase() + stat.slice(1);
+      const clean = {};
+      for (const [tier, value] of Object.entries(tiers)) {
+        if (value) clean[tier] = value;
+      }
+      if (Object.keys(clean).length) out[side][name] = clean;
+    }
+  }
+  const damage = raw.true_damage || {};
+  out.trueFlat = damage.flat || 0;
+  out.truePct = damage.pct || [];
+  outputCache.set(skill.id, out);
+  return out;
+}
+
+// Field buffs do not stack: two sources granting Atk+6 still give +6. Only the
+// strongest source already in the build counts, so a second one is not scored
+// twice. In-combat boosts and true damage do stack and are summed.
+function kitBaseline(anchors) {
+  const ally = {};
+  const foe = {};
+  for (const skill of anchors) {
+    const out = normaliseOutput(skill);
+    for (const [stat, tiers] of Object.entries(out.ally)) {
+      if (tiers.visible > 0) ally[stat] = Math.max(ally[stat] || 0, tiers.visible);
+    }
+    for (const [stat, tiers] of Object.entries(out.foe)) {
+      if (tiers.visible < 0) foe[stat] = Math.min(foe[stat] || 0, tiers.visible);
+    }
+  }
+  return { ally, foe };
+}
+
+function scoringPolicy() {
+  const scoring = data.meta?.scoring || {};
+  return {
+    statWeights: scoring.statWeights || { Atk: 1, Spd: 1, Def: 1, Res: 1 },
+    foeWeight: scoring.foeWeight ?? 0.9,
+    trueWeight: scoring.trueDamageWeight ?? 1,
+    drWeight: scoring.damageReductionWeight ?? 0.2,
+    maxDR: scoring.maxDamageReduction ?? 80,
+    baselines: scoring.percentBaselines || { Atk: 60, Spd: 50, Def: 45, Res: 40 },
+  };
+}
+
+// Value of a candidate for the scoped unit with every condition active, minus
+// whatever the current build already provides.
+function scoreOutput(skill, base) {
+  const policy = scoringPolicy();
+  const out = normaliseOutput(skill);
+  const parts = { ally: {}, foe: {}, trueFlat: 0, truePct: [], dr: 0 };
+  let score = 0;
+
+  for (const stat of STATS) {
+    const weight = policy.statWeights[stat] ?? 1;
+
+    const tiers = out.ally[stat] || {};
+    const covered = Math.max(0, base.ally[stat] || 0);
+    const visible = Math.max(0, (tiers.visible || 0) - covered);
+    const value = (tiers.flat || 0) + (tiers.combat || 0) + visible;
+    if (value) {
+      parts.ally[stat] = value;
+      score += value * weight;
+    }
+
+    const foeTiers = out.foe[stat] || {};
+    const applied = Math.max(0, -(base.foe[stat] || 0));
+    const foeValue = Math.max(0, -(foeTiers.visible || 0) - applied)
+      + Math.max(0, -(foeTiers.combat || 0));
+    if (foeValue) {
+      parts.foe[stat] = foeValue;
+      score += foeValue * weight * policy.foeWeight;
+    }
+  }
+
+  if (out.trueFlat) {
+    parts.trueFlat = out.trueFlat;
+    score += out.trueFlat * policy.trueWeight;
+  }
+  for (const entry of out.truePct) {
+    const stats = entry.stats || [entry.stat];
+    const baseline = Math.max(...stats.map((stat) => policy.baselines[stat] ?? 50));
+    const points = (entry.value / 100) * baseline;
+    if (!points) continue;
+    parts.truePct.push({ ...entry, stats, points });
+    score += points * policy.trueWeight;
+  }
+
+  const dr = Math.min(out.dr || 0, policy.maxDR);
+  if (dr) {
+    parts.dr = dr;
+    score += dr * policy.drWeight;
+  }
+
+  return { score: Math.round(score * 10) / 10, parts };
+}
+
+// "+15 Atk/Spd", "−7 Spd/Res on foe", "+5 true damage", "30% DR".
+function outputSummary(parts) {
+  const groups = (values) => {
+    const byValue = new Map();
+    for (const stat of STATS) {
+      const value = values[stat];
+      if (!value) continue;
+      if (!byValue.has(value)) byValue.set(value, []);
+      byValue.get(value).push(stat);
+    }
+    return [...byValue].map(([value, stats]) => `${signed(value)} ${stats.join('/')}`);
+  };
+
+  const bits = [...groups(parts.ally)];
+  const foe = groups(parts.foe);
+  if (foe.length) bits.push(`${foe.join(' · ')} on foe`);
+  if (parts.trueFlat) bits.push(`${signed(parts.trueFlat)} true damage`);
+  for (const entry of parts.truePct) {
+    const stats = entry.stats || [entry.stat];
+    bits.push(`${entry.value}% ${stats.join('/')} bonus damage`);
+  }
+  if (parts.dr) bits.push(`${parts.dr}% DR`);
+  return bits.join(' · ');
+}
+
+function outputLine(skill, scored) {
+  const summary = outputSummary(scored.parts);
+  if (!summary) {
+    return `<span class="si-scorerow">
+      <span class="si-score si-score--zero">0.0</span>
+      <span class="si-output">utility only — no flat stats or damage</span>
+    </span>`;
+  }
+  return `<span class="si-scorerow">
+      <span class="si-score" title="max-condition output score — every condition treated as active">${scored.score.toFixed(1)}</span>
+      <span class="si-output"><b>estimated max output</b> ${esc(summary)}</span>
+    </span>`;
+}
+
+// Step 1 filter + step 2 score, then rank by output.
 function rankCandidates(slot, anchors) {
   const taken = new Set(selectedSkills().map((skill) => skill.id));
   const pool = (data.byCat.get(slot.cat) || []).filter((skill) => (
-    isRecommendable(skill)                       // never prf, never a prerequisite
+    isRecommendable(skill)                       // no prf, no prerequisite, SP floor
+    && inheritable(skill)                        // weapon / movement / ownership
     && !taken.has(skill.id)                      // never offer a skill already equipped
-    && compatible(skill, state.unit)
     && passesFilters(skill)
   ));
 
+  const base = kitBaseline(anchors);
   const covered = new Set();
   for (const anchor of anchors) for (const effect of anchor.named_effects) covered.add(effect);
 
-  // A minimal core matters most: passives before seals, specials before weapons.
-  const slotWeight = { passivea: 1.15, passiveb: 1.15, passivec: 1.15, special: 1.05 }[slot.cat] || 1;
-
   const ranked = [];
   for (const skill of pool) {
-    const reasons = [...effectReasons(skill, anchors), ...statReasons(skill, anchors)];
-    if (!reasons.length) continue;
-    const raw = reasons.reduce((sum, reason) => sum + reason.weight, 0);
-    const redundant = skill.named_effects.filter((effect) => covered.has(effect)).length;
-    const score = raw * slotWeight - redundant * 0.9;
-    if (score <= 0) continue;
-    ranked.push({ skill, score, raw, reasons });
+    const scored = scoreOutput(skill, base);
+    // With a build loaded the card must still explain itself, so synergy stays
+    // a requirement; the archetype-only view simply ranks by raw output.
+    const reasons = anchors.length
+      ? [...effectReasons(skill, anchors), ...statReasons(skill, anchors)]
+      : [];
+    if (anchors.length && !reasons.length) continue;
+    if (scored.score <= 0 && !reasons.length) continue;
+    ranked.push({ skill, reasons, ...scored });
   }
 
-  if (!ranked.length) return [];
-
-  // Relevance decides *which* skills qualify; the meta order decides how they
-  // are listed. Keeping the strong matches (at least 60% of the best score)
-  // and then sorting by SP desc, version desc, name asc means the five cards
-  // are always top-tier first instead of drifting on score noise.
-  const best = Math.max(...ranked.map((row) => row.score));
-  const strong = ranked.filter((row) => row.score >= best * RELEVANCE_KEEP);
-  const fillers = ranked.filter((row) => row.score < best * RELEVANCE_KEEP);
-
-  // Thin slots (X echoes, seals) can leave the shortlist empty, so pad with the
-  // next-best matches rather than showing an incomplete list.
-  const need = Math.max(0, 5 - strong.length);
-  const order = (a, b) => (b.skill.sp || 0) - (a.skill.sp || 0)
+  // Highest non-redundant output first; ties fall back to the meta order.
+  ranked.sort((a, b) => b.score - a.score
+    || (b.skill.sp || 0) - (a.skill.sp || 0)
     || (b.skill.ver || 0) - (a.skill.ver || 0)
-    || a.skill.name.localeCompare(b.skill.name, 'en');
+    || a.skill.name.localeCompare(b.skill.name, 'en'));
 
-  const chosen = strong.concat(fillers.slice(0, need));
-  return chosen.sort(order).slice(0, 5);
+  return ranked.slice(0, 5);
 }
 
 function reasonList(reasons) {
@@ -1010,9 +1228,9 @@ function renderSuggestions() {
   const emptySlots = SLOTS.filter((slot) => !state.picks[slot.key]);
   const note = $('suggest-note');
 
-  if (!anchors.length) {
+  if (!anchors.length && !hasArchetype()) {
     note.textContent = '';
-    host.innerHTML = '<p class="empty-note">Select a hero or a few skills to see complementary picks for the empty slots.</p>';
+    host.innerHTML = '<p class="empty-note">Select a hero — or set a weapon + movement archetype in the filters — to score every skill that unit can inherit.</p>';
     return;
   }
 
@@ -1038,14 +1256,15 @@ function renderSuggestions() {
       <div class="suggest-block">
         <h3>${esc(slot.label)} <span class="pill pill--empty">empty</span></h3>
         <ul class="suggest-list">
-          ${ranked.map(({ skill, reasons }) => `
+          ${ranked.map(({ skill, reasons, score, parts }) => `
             <li>
               <button type="button" class="suggest-item" data-slot="${esc(slot.key)}" data-id="${esc(skill.id)}">
                 <span class="si-top">
                   <span class="si-name">${esc(skill.name)}</span>
                   <span class="si-meta">${esc(metaLine(skill))}</span>
                 </span>
-                <span class="si-why">${reasonList(reasons)}</span>
+                ${outputLine(skill, { score, parts })}
+                ${reasons.length ? `<span class="si-why">${reasonList(reasons)}</span>` : ''}
                 <span class="si-effects">${effectChips(skill)}</span>
               </button>
             </li>`).join('')}
@@ -1053,8 +1272,11 @@ function renderSuggestions() {
       </div>`);
   }
 
+  const scope = state.unit
+    ? 'this hero'
+    : hasArchetype() ? 'this archetype' : 'any unit';
   note.textContent = blocks.length
-    ? `top-tier inheritable · ${anchors.length} selected skill${anchors.length === 1 ? '' : 's'}${hasActiveFilters() ? ' · filters on' : ''}`
+    ? `top-tier inheritable · ${scope} · ranked by max output${anchors.length ? ` · ${anchors.length} selected skill${anchors.length === 1 ? '' : 's'}` : ''}${hasActiveFilters() ? ' · filters on' : ''}`
     : '';
 
   const barrenNote = blocks.length && barren.length
@@ -1088,6 +1310,9 @@ function refresh({ syncOptions = false } = {}) {
 
 function applyUnit(unitId) {
   state.unit = unitId ? data.unitById.get(unitId) || null : null;
+  // A hero is a more specific answer than an archetype; drop the archetype so
+  // clearing the hero later cannot silently switch the scope back.
+  if (state.unit) state.archetype = { weapon: '', move: '' };
   const kit = state.unit?.kit || {};
   for (const slot of SLOTS) {
     const baseId = kit[slot.cat];
@@ -1095,6 +1320,9 @@ function applyUnit(unitId) {
     state.picks[slot.key] = skill && compatible(skill, state.unit) ? skill.id : null;
   }
   combos.character.setValue(state.unit?.id || null);
+  // Selecting a hero clears the archetype fields; repaint them so the panel
+  // matches the scope that is actually in force.
+  if (state.unit) renderFilters();
   syncSlotOptions();
   refresh();
 }
@@ -1106,6 +1334,10 @@ function applyUnit(unitId) {
 function writeHash() {
   const params = new URLSearchParams();
   if (state.unit) params.set('unit', state.unit.id);
+  if (!state.unit) {
+    if (state.archetype.weapon) params.set('wt', state.archetype.weapon);
+    if (state.archetype.move) params.set('mv', state.archetype.move);
+  }
   for (const slot of SLOTS) {
     if (state.picks[slot.key]) params.set(slot.key, state.picks[slot.key]);
   }
@@ -1118,6 +1350,10 @@ function readHash() {
   const params = new URLSearchParams(location.hash.slice(1));
   const unitId = params.get('unit');
   state.unit = unitId ? data.unitById.get(unitId) || null : null;
+  state.archetype = {
+    weapon: state.unit ? '' : (params.get('wt') || ''),
+    move: state.unit ? '' : (params.get('mv') || ''),
+  };
   for (const slot of SLOTS) {
     const id = params.get(slot.key);
     const skill = id ? data.skillById.get(id) : null;
@@ -1133,7 +1369,7 @@ function readHash() {
       state.picks[slot.key] = null;
     }
   }
-  return Boolean(state.unit || selectedSkills().length);
+  return Boolean(state.unit || hasArchetype() || selectedSkills().length);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1224,6 +1460,7 @@ async function init() {
 
   if (readHash()) {
     combos.character.setValue(state.unit?.id || null);
+    if (hasArchetype()) renderFilters();
     syncSlotOptions();
     refresh();
   } else {

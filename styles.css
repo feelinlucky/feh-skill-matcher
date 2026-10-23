@@ -927,3 +927,73 @@ body[data-ready="false"] .board { opacity: 0.55; }
 }
 
 .si-meta { white-space: nowrap; }
+
+/* ---------- archetype scope ---------- */
+
+.archetype-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.archetype-field {
+  display: grid;
+  gap: 3px;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.archetype-field select {
+  font: inherit;
+  font-size: 12px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--ink);
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 5px 7px;
+}
+
+.archetype-field select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* ---------- max-condition output on a suggestion card ---------- */
+
+.si-scorerow {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.si-score {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 999px;
+  padding: 1px 6px;
+}
+
+.si-output {
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+}
+
+.si-output b {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  font-size: 9.5px;
+  color: var(--muted);
+}
+
+.si-score--zero {
+  color: var(--muted);
+  background: #f1efe9;
+}
