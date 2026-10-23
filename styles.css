@@ -901,3 +901,29 @@ body[data-ready="false"] .board { opacity: 0.55; }
 @media (max-width: 1180px) {
   .filter-chips { max-height: 84px; }
 }
+
+/* list-scope toggle (legacy / prf visibility) */
+
+.chip--toggle::before {
+  border-radius: 999px;
+}
+
+.chip--toggle.is-on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.chip--toggle.is-on::before {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.filter-scope-note {
+  margin: 8px 0 0;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.si-meta { white-space: nowrap; }

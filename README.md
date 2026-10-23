@@ -94,6 +94,11 @@ Spd seal is ranked as the best answer to a Spd check.
   "synergy_targets": [],
   "check_stats": [],
   "clauses": [["buff", "ally", "visible", "At start of turn, … grants Atk/Spd+6 …"]],
+  "ver": 1005,
+  "exclusive": false,
+  "max_tier": true,
+  "is_sub_tier": false,
+  "recommendable": true,
   "desc": "At start of turn, …"
 }
 ```
@@ -109,9 +114,10 @@ Skill data comes from [`matxx/feh-data`](https://github.com/matxx/feh-data), clo
 
 | source | output | contents |
 | --- | --- | --- |
-| `data/skills.json`, `data/skills-descriptions.json` | `data/skills.json` | 6,200+ skills with slot, SP, might, cooldown, restrictions, wording, modifier tiers, named effects and synergy targets |
+| `data/skills.json`, `data/skills-descriptions.json` | `data/skills.json` | 3,500 skills (from 6,350 raw) with slot, SP, might, cooldown, restrictions, wording, modifier tiers, named effects, synergy targets and the top-tier flags described below |
 | `data/units.json`, `data/skills_units.json` | `data/units.json` | 1,400+ heroes with weapon / move type, default kit and own prf skills |
 | `scripts/effects_catalog.py` | `data/effects.json` | the named-effect catalog and the synergy rule table |
+| `scripts/meta_rules.py` | `data/meta.json` | the top-tier policy: SP floors, prf/sub-tier rules and the sort order the UI applies |
 
 Rebuild after updating the data:
 
@@ -131,6 +137,73 @@ plus the skill's own name (so "Bonus Doubler 4" provides `bonus_doubler` even th
 never says it). It is a readable summary, not a rules engine — always check the in-game text for
 exact behaviour.
 
+## Top-tier recommendations
+
+The matcher is meant to suggest what to *inherit today*, so it never leads with a skill that has
+already been superseded or that no other hero can hold. Two gates run before a card is drawn.
+
+**1. No unit-exclusive (prf) skills.** Every skill is tagged from the raw export's `is_prf` /
+`base_id` information. `exclusive: true` rows (Fólkvangr, Great Aether, Beorc's Blessing, every
+refine) are dropped from suggestions and from the slot dropdowns unless the hero already has them
+in their default kit — a kit must still render its own prf weapon.
+
+**2. Only the terminal tier of a family.** The build walks each skill's `upgrade_ids` to build an
+`upgrades_of` graph, then keeps only skills with no successor. Each entry carries the flags the UI
+uses:
+
+| field | meaning |
+| --- | --- |
+| `exclusive` | prf / hero-locked — never recommended |
+| `max_tier` | has no higher tier in its family (terminal node) |
+| `is_sub_tier` | a prerequisite of something else (kept only when a default kit needs it) |
+| `recommendable` | `max_tier && !exclusive && sp >= floor` — the single gate the UI trusts |
+| `ver` | release version encoded as an integer (`"10.10"` → `1010`) so sorting is chronological |
+
+The SP floor per slot lives in `scripts/meta_rules.py` and is mirrored into `data/meta.json`:
+
+| slot | floor | why |
+| --- | --- | --- |
+| weapon | 300 | refined/PRF-era weapons sit at 300+; older 200-SP weapons are legacy |
+| assist | 150 | movement/dual assists are 150; Reposition-class utility stays available |
+| special | 500 | modern specials (Godlike Reflexes, Armored Beacon…) are 500 |
+| A / B / C | 300 | tier-4 passives are 300; tier-3 and below are legacy |
+| sacred seal | 240 | seals top out at 240 |
+| X (echo) | 0 | echoes carry no SP in the export |
+
+A skill that is a prerequisite of something else is suppressed even when its own SP clears the
+floor (Swift Sparrow 2 → Sly Swift Sparrow), because holding the lower tier is never the goal.
+Rows that a hero's default kit references are kept regardless, and flagged `is_sub_tier`, so
+loading a hero never leaves an empty slot. Skipped rows are counted in the build report:
+
+```
+skills: 3533 units: 1427
+  pruned 2702 legacy entries (prerequisites / below SP floor, not referenced by any default kit)
+
+per slot: total / recommendable / exclusive
+  A          256 /   181 /    75
+  ...
+```
+
+**Ordering.** Synergy decides *which* skills qualify — a candidate still needs a named-effect or
+stat reason to appear — but the displayed list is then ordered top-tier first:
+relevance shortlist (≥ 60% of the best score, padded for thin slots) → **SP desc → release version
+desc → name asc**. The slot dropdowns use the same `SP → version → name` order, so the newest tier-4
+passive sits at the top of the list instead of the beta-era skill with the best stat line.
+
+**The scope switch.** The *include prf & off-meta* chip in the filter panel relaxes both gates for
+browsing: unit-exclusive skills and prerequisite rows that survived the build become selectable and
+can be read on a hero. Because the build deletes the rest, the switch cannot resurrect fully pruned
+legacy rows (Fury 3 is not in the data at all). To inspect the complete historical list, rebuild
+with:
+
+```bash
+python3 scripts/build_data.py --keep-legacy   # skip prune_legacy(), keep every row
+```
+
+`data/meta.json` records the active policy (`spFloors`, `floorNotes`, `slotLabels`, `rules`,
+`pruned`), and the UI reads it at runtime — so the floors and the note in the filter panel always
+match the data file that shipped with them.
+
 ## Development
 
 It is a static site; no build step is needed for the frontend.
@@ -146,5 +219,6 @@ Files:
 * `app.js` — dropdowns, filters, effect grouping, tier accumulation, synergy engine
 * `scripts/build_data.py` — data pipeline from `feh-data`
 * `scripts/effects_catalog.py` — named-effect constants, parser rules and synergy weights
+* `scripts/meta_rules.py` — SP floors, version encoding and the recommendability policy
 
 Fire Emblem Heroes is © Nintendo / Intelligent Systems. This is an unofficial fan project.
