@@ -4,47 +4,97 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>FEH Skill Synergy Matcher</title>
-  <!-- Tom Select CSS -->
-  <link href="https://cdn.jsdelivr.net/npm/tom-select@2.2.2/dist/css/tom-select.bootstrap5.min.css" rel="stylesheet">
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 2rem; background: #1a1b1e; color: #e0e0e0; }
-    .container { max-width: 800px; margin: auto; }
-    .filter-group { margin-bottom: 1.5rem; }
-    label { font-weight: bold; display: block; margin-bottom: 0.5rem; color: #a5d6a7; }
-    .card { background: #2b2c30; border-radius: 8px; padding: 1rem; margin-top: 1rem; border-left: 4px solid #81c784; }
-    .synergy-badge { background: #388e3c; color: white; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.8rem; margin-right: 0.3rem; }
-  </style>
+  <meta name="description" content="Pick a Fire Emblem Heroes hero, load their default skills, and see what each slot grants, inflicts and stacks — plus the best complementary skills for empty slots.">
+  <link rel="stylesheet" href="styles.css">
 </head>
-<body>
-  <div class="container">
-    <h1>FEH Skill Synergy Matcher</h1>
-    
-    <div class="filter-group">
-      <label for="primary-skill">1. Select Target Skill:</label>
-      <select id="primary-skill" placeholder="Search for a skill (e.g., Bonus Doubler 4)..."></select>
+<body data-ready="false">
+
+  <div class="page">
+
+    <header class="masthead">
+      <div class="brand">
+        <p class="eyebrow">Fire Emblem Heroes</p>
+        <h1>Skill Synergy Matcher</h1>
+      </div>
+      <p class="blurb">
+        Choose a hero to load their default kit, then tune each slot. The panels break the build
+        into what it grants, what it inflicts on foes, and the constants that stack up — and
+        suggest skills that fill the gaps.
+      </p>
+    </header>
+
+    <div class="board">
+
+      <!-- ── left: character + skill set ─────────────────────────────── -->
+      <div class="column column--left">
+
+        <section class="panel character-panel">
+          <div class="panel-head">
+            <h2 class="panel-title">character</h2>
+            <span class="panel-note" id="unit-count">loading…</span>
+          </div>
+          <div id="combo-character"></div>
+          <p class="character-meta" id="character-meta"></p>
+        </section>
+
+        <section class="panel skillset-panel">
+          <div class="panel-head">
+            <h2 class="panel-title">skill set</h2>
+            <span class="panel-note" id="kit-note"></span>
+          </div>
+          <div class="slots" id="slots"></div>
+        </section>
+
+      </div>
+
+      <!-- ── middle: effect breakdown ────────────────────────────────── -->
+      <section class="panel panel--effects">
+        <div class="panel-head">
+          <h2>effect breakdown</h2>
+          <span class="panel-note" id="effect-note"></span>
+        </div>
+        <div id="effects" class="effects">
+          <p class="empty-note">Select a skill to see what it does.</p>
+        </div>
+      </section>
+
+      <!-- ── right: accumulated constants ────────────────────────────── -->
+      <section class="panel panel--constants">
+        <div class="panel-head">
+          <h2>accumulated constants</h2>
+          <span class="panel-note" id="sp-note"></span>
+        </div>
+        <div class="targets" id="targets"></div>
+        <div class="net-row" id="net-row"></div>
+        <p class="const-note" id="const-note">
+          Visible bonuses and in-combat bonuses are tracked separately, then summed per target.
+        </p>
+      </section>
+
+      <!-- ── suggestions (under the breakdown + constants) ───────────── -->
+      <section class="panel panel--suggest">
+        <div class="panel-head">
+          <h2>suggested complements</h2>
+          <span class="panel-note" id="suggest-note"></span>
+        </div>
+        <div id="suggestions" class="suggest-grid">
+          <p class="empty-note">Select a hero or a few skills to see complementary picks.</p>
+        </div>
+      </section>
+
     </div>
 
-    <div class="filter-group">
-      <label for="target-slot">2. Filter Complementary Slot:</label>
-      <select id="target-slot">
-        <option value="ALL">All Slots</option>
-        <option value="A">A Slot</option>
-        <option value="B">B Slot</option>
-        <option value="C">C Slot</option>
-        <option value="Special">Special</option>
-        <option value="Sacred Seal">Sacred Seal</option>
-        <option value="X">X (Attuned) Slot</option>
-      </select>
-    </div>
+    <footer class="site-foot">
+      <span>
+        Skill data from
+        <a href="https://github.com/matxx/feh-data" target="_blank" rel="noopener">matxx/feh-data</a>,
+        rebuilt with <code>scripts/build_data.py</code>.
+      </span>
+      <span>Unofficial fan tool · Fire Emblem Heroes is © Nintendo / Intelligent Systems.</span>
+    </footer>
 
-    <div id="results">
-      <h3>Matching Complementary Skills</h3>
-      <div id="results-list">Select a skill above to see synergistic combinations.</div>
-    </div>
   </div>
 
-  <!-- Tom Select JS -->
-  <script src="https://cdn.jsdelivr.net/npm/tom-select@2.2.2/dist/js/tom-select.complete.min.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
