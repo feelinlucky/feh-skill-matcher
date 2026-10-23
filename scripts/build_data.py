@@ -1,20 +1,39 @@
 #!/usr/bin/env python3
 """Build the compact runtime dataset used by the web app from `feh-data`.
 
-Source (https://github.com/matxx/feh-data, cloned into ./feh-data):
+Source (https://github.com/matxx/feh-data, cloned into./feh-data):
 
     feh-data/data/skills.json                skill list (category, sp, restrictions, ...)
     feh-data/data/skills-descriptions.json   skill wording
     feh-data/data/units.json                 heroes
     feh-data/data/skills_units.json          which hero learns / equips which skill
 
-Output (committed so GitHub Pages works without the submodule):
+Output (committed so GitHub Pages works without the raw export):
 
-    data/skills.json   skills + pre-computed effect breakdown
-    data/units.json    heroes + their default (base) skill set + prf skill ids
+    data/skills.json    skills + modifier tiers + named effects + synergy targets
+    data/units.json     heroes + their default (base) skill set + prf skill ids
+    data/effects.json   the named-effect catalog and synergy rules used by the UI
+
+Skill schema
+------------
+    {
+      "id", "name", "slot", "cat", "sp", "tier", "wt", "cd", "mt", "rng",
+      "prf", "refine", "base", "res", "desc",
+      "named_effects":   ["visible_buff_grant", "special_acceleration"],
+      "flat_modifiers":  {"visible_atk": 6, "visible_spd": 6, "combat_atk": 3},
+      "synergy_targets": ["visible_buff_scaling", "high_cooldown_special"],
+      "check_stats":     ["Spd"],
+      "clauses":         [["buff", "ally", "visible", "Atk/Spd+6 for 1 turn"]]
+    }
+
+`flat_modifiers` keys are ``[foe_]<tier>_<stat>`` where tier is one of
+``visible`` (field buffs/debuffs), ``flat`` (always-on stat changes such as
+Life and Death), ``phantom`` ("as if granted", comparison only) or ``combat``
+(during combat only). Ally entries have no prefix, foe entries are ``foe_``
+prefixed, and both use the sign as written in the wording.
 
 Usage:
-    git submodule update --init feh-data
+    git clone https://github.com/matxx/feh-data feh-data
     python3 scripts/build_data.py
     python3 scripts/build_data.py --source /path/to/feh-data/data
 """
@@ -23,31 +42,74 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import unicodedata
 from pathlib import Path
 
-SLOT_CATEGORIES = [
-    "weapon",
-    "assist",
-    "special",
-    "passivea",
-    "passiveb",
-    "passivec",
-    "sacredseal",
-    "passivex",
-]
-# Categories that are tied to a specific hero and are not slottable.
+from effects_catalog import (
+    CHECK_STAT_PATTERNS,
+    EFFECTS,
+    SYNERGY_RULES,
+    TARGET_RULES,
+    catalog,
+    name_effects,
+)
+
+SLOT_BY_CATEGORY = {
+    "weapon": "Weapon",
+    "assist": "Assist",
+    "special": "Special",
+    "passivea": "A",
+    "passiveb": "B",
+    "passivec": "C",
+    "sacredseal": "Seal",
+    "passivex": "X",
+}
+# Categories that belong to a hero rather than to a slot.
 NON_SLOT_CATEGORIES = {"duo", "harmonized", "emblem"}
 
 STATS = ("Atk", "Spd", "Def", "Res")
 STAT_ALT = "|".join(STATS)
 
+TIERS = ("visible", "flat", "phantom", "combat")
+
 STAT_DELTA_RE = re.compile(
     rf"\b((?:{STAT_ALT})(?:\s*/\s*(?:{STAT_ALT}))*)\s*([+\-−])\s*(\d+)\b"
 )
-TRUE_DAMAGE_RE = re.compile(r"(?:deals?|deal)\s*\+?(\d+)\s*damage", re.I)
-HEAL_RE = re.compile(r"restores?\s+(\d+)\s*HP", re.I)
-DR_FLAT_RE = re.compile(r"reduces damage[^.]*?by\s+(\d+)", re.I)
+GLOSSARY_HEADER_RE = re.compile(r"^【[^】]{1,40}】$")
+
+FOE_TARGET_RE = re.compile(
+    r"\b(?:the |those |all |nearest |any )*foes?\b(?! ?\w*ally)|foe's\b|"
+    r"\bon (?:the )?target\b|inflicts?[^.]{0,90}?\bfoes?\b",
+    re.I,
+)
+ALLY_TARGET_RE = re.compile(
+    r"to unit\b|on unit\b|unit and allies|to (?:the )?unit\b|unit's own\b|"
+    r"grants?[^.]{0,40}\bto (?:the )?unit\b",
+    re.I,
+)
+DURATION_RE = re.compile(
+    r"for 1 turn|for 1 turn only|that turn only|through (?:their|its) next action|"
+    r"through unit's next action|for the rest of the turn",
+    re.I,
+)
+COMBAT_RE = re.compile(r"during combat|\bin combat\b|at the start of combat", re.I)
+
+# Wording that signals a clause is a formula/constant rather than a plain number.
+CONST_RE = re.compile(r"\bX\s*=|equal to|×\s*\d|\d\s*×|% of |calculates? each stat", re.I)
+TRUE_DAMAGE_RE = re.compile(r"deals? \+\d+ damage|damage = \d+% of", re.I)
+# Fragments such as "After combat" or "When Special triggers" left behind by
+# sub-clause splitting carry no effect of their own.
+FRAGMENT_RE = re.compile(
+    r"^(?:after combat|when special triggers|during combat|at start of turn|"
+    r"at start of combat|after canto|if unit is within \d+ space[s]? of an ally|"
+    r"if unit initiates combat|while unit|if [^.a-z]{0,0}[^.]{0,60})$",
+    re.I,
+)
+EFFECT_VERB_RE = re.compile(
+    r"grant|inflict|deal|reduc|restor|neutrali[sz]|prevent|treat|cooldown|"
+    r"accelerat|convert|disable|movement|another action",
+    re.I,
+)
+HEAL_RE = re.compile(r"restores? (?:\d+% of .{0,20} )?(?:\d+ )?hp", re.I)
 
 
 def load(path: Path):
@@ -55,27 +117,46 @@ def load(path: Path):
         return json.load(fh)
 
 
+# --------------------------------------------------------------------------- #
+# text handling
+# --------------------------------------------------------------------------- #
+
 def norm_text(raw: str | None) -> str:
     if not raw:
         return ""
     text = re.sub(r"<br\s*/?>", "\n", raw)
     text = re.sub(r"<[^>]+>", "", text)
-    text = text.replace("&amp;", "&").replace("&#39;", "'").replace("&quot;", '"')
+    text = (text.replace("&amp;", "&").replace("&#39;", "'")
+            .replace("&quot;", '"').replace("&nbsp;", " "))
     return text.strip()
-
-
-GLOSSARY_HEADER_RE = re.compile(r"^【[^】]+】$")
 
 
 def main_text(text: str) -> str:
     """Drop the trailing glossary paragraphs (【Bonus】, 【Penalty】, ...)."""
     kept: list[str] = []
     for line in text.split("\n"):
-        line = line.strip()
-        if GLOSSARY_HEADER_RE.match(line):
+        if GLOSSARY_HEADER_RE.match(line.strip()):
             break
         kept.append(line)
     return "\n".join(kept)
+
+
+# A clause break is only worth taking when a new verb starts the next clause,
+# otherwise "unit's Special is ready" gets orphaned mid-sentence.
+SUBCLAUSE_STARTS = (
+    r"grants?", r"inflicts?", r"deals?", r"reduces?", r"restores?",
+    r"neutrali[sz]es?", r"prevents?", r"treats?", r"accelerates?",
+    r"unit (?=(?:deals|takes|attacks|cannot|can |gains|is |moves|suffers|and ))",
+    r"foe (?=(?:deals|takes|cannot|can |is |suffers))",
+    r"target (?=(?:cannot|can |is ))",
+    r"allies (?=(?:and |within |deals))",
+)
+SUBCLAUSE_RE = re.compile(
+    r"\s*(?:;\s*|,?\s+and\s+(?:also,?\s+)?|,\s*)"
+    r"(?=(?:" + "|".join(SUBCLAUSE_STARTS) + r"))",
+    re.I,
+)
+QUOTED_RE = re.compile(r'"[^"]*"|“[^”]*”')
 
 
 def split_sentences(text: str) -> list[str]:
@@ -83,19 +164,27 @@ def split_sentences(text: str) -> list[str]:
     out: list[str] = []
     buffer = ""
     depth = 0
+    in_quote = False
     index = 0
     while index < len(text):
         char = text[index]
         buffer += char
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth = max(0, depth - 1)
-        if char in ".!?" and depth == 0:
+        if char == '"':
+            in_quote = not in_quote
+        elif not in_quote:
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth = max(0, depth - 1)
+        closes_quote = (in_quote and index + 1 < len(text)
+                        and text[index + 1] in '"\u201d')
+        if char in ".!?" and depth == 0 and (not in_quote or closes_quote):
             cursor = index + 1
             while cursor < len(text) and text[cursor] in '"\u201d':
                 buffer += text[cursor]
                 cursor += 1
+            if in_quote and closes_quote:
+                in_quote = False
             if cursor >= len(text) or text[cursor].isspace():
                 out.append(buffer.strip())
                 buffer = ""
@@ -107,193 +196,348 @@ def split_sentences(text: str) -> list[str]:
     return out
 
 
-def split_clauses(text: str) -> list[str]:
-    """Split wording into display-sized clauses."""
-    out: list[str] = []
+def split_subclauses(sentence_text: str) -> list[str]:
+    """Break a sentence at ';' and at ', and <verb>' outside quotes/parens.
+
+    "grants Atk/Spd+6 and grants Special cooldown charge +1 ... during combat"
+    becomes two clauses so a field buff is not misread as an in-combat buff.
+    """
+    parts: list[str] = []
+    buffer = ""
+    depth = 0
+    in_quote = False
+    index = 0
+    while index < len(sentence_text):
+        char = sentence_text[index]
+        if char == '"':
+            in_quote = not in_quote
+        elif not in_quote:
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth = max(0, depth - 1)
+        if not in_quote and depth == 0:
+            match = SUBCLAUSE_RE.match(sentence_text, index)
+            if match and match.end() > index and buffer.strip():
+                parts.append(buffer.strip())
+                buffer = ""
+                index = match.end()
+                continue
+        buffer += char
+        index += 1
+    if buffer.strip():
+        parts.append(buffer.strip())
+    return parts
+
+
+def split_clauses(text: str) -> list[tuple[str, str]]:
+    """(clause, parent sentence) pairs.
+
+    The parent sentence matters for timing: in
+    "grants Atk/Spd+6 to unit, ..., and reduces damage during combat"
+    the trailing "during combat" governs the whole sentence.
+    """
+    out: list[tuple[str, str]] = []
     for line in main_text(text).split("\n"):
-        for part in split_sentences(line.strip()):
-            part = part.strip()
-            if part:
-                out.append(part)
+        for line_part in split_sentences(line.strip()):
+            for part in split_subclauses(line_part):
+                part = part.strip(" ,;")
+                if part:
+                    out.append((part, line_part))
     return out
 
 
-def parse_stats(block: str) -> dict[str, int]:
-    """Collect positive Atk/Spd/Def/Res deltas from a clause, e.g. 'Atk/Spd+6'.
-
-    Negative numbers in wording are usually stat comparisons ("foe's Spd-4")
-    rather than penalties, so they are handled by the penalty branch instead.
-    """
-    found: dict[str, int] = {}
-    for names, sign, value in STAT_DELTA_RE.findall(block):
-        if sign in "-−":
-            continue
-        for name in re.split(r"\s*/\s*", names):
-            found[name] = found.get(name, 0) + int(value)
-    return found
+def unquoted(text: str) -> str:
+    """Drop quoted status descriptions before judging a clause's timing."""
+    return QUOTED_RE.sub(" ", text)
 
 
-def parse_penalties(block: str) -> dict[str, int]:
-    """Collect penalty magnitudes such as 'Inflicts Atk/Spd-6 on foe'."""
-    found: dict[str, int] = {}
-    for names, sign, value in STAT_DELTA_RE.findall(block):
-        if sign not in "-−":
-            continue
-        for name in re.split(r"\s*/\s*", names):
-            found[name] = found.get(name, 0) + int(value)
-    return found
-
-
-def sentence(text: str, limit: int = 190) -> str:
+def sentence(text: str, limit: int = 200) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "\u2026"
 
 
-def add_amount(bucket: dict, stat: str, amount: int, combat: bool) -> None:
-    row = bucket.setdefault(stat, [0, 0])
-    row[1 if combat else 0] += amount
+# --------------------------------------------------------------------------- #
+# modifiers
+# --------------------------------------------------------------------------- #
+
+POSSESSIVE_RE = re.compile(r"(?:unit|foe|ally|target)(?:'s|\u2019s)\s*$", re.I)
+PHANTOM_RE = re.compile(
+    rf"\b({STAT_ALT})(?:'s)?\s+as if granted\s*([+\-−])?\s*(\d+)", re.I)
+THRESHOLD_RE = re.compile(r"(?:HP|Atk|Spd|Def|Res)\s*[≥><]=?\s*\d+\s*%?", re.I)
 
 
-def analyse_skill(desc: str, category: str, cd: int | None) -> dict:
-    """Heuristically classify what a skill does.
+def parse_stat_deltas(clause: str) -> dict[str, int]:
+    """{'Atk': 6, 'Spd': 6} for 'grants Atk/Spd+6'.
 
-    Returns the numbers the right-hand panel accumulates (`a` = granted to the
-    unit / allies, `f` = inflicted on foes, each split into visible/in-combat),
-    the clause list the middle panel groups (`sum`), and synergy `tags`.
+    Possessive forms ("unit's Spd-4", "foe's Def-6") are stat comparisons, not
+    modifiers, so they are skipped; "Inflicts Spd-5" (no possessive) is a real
+    change to the unit's own stat line.
     """
-    body = main_text(desc)
-    lowered = body.lower()
-    ally: dict[str, list[int]] = {}
-    foe: dict[str, list[int]] = {}
-    summaries: list[list] = []  # [kind, target, text, inCombat]
-    tags: set[str] = set()
+    found: dict[str, int] = {}
+    for match in STAT_DELTA_RE.finditer(clause):
+        names, sign, value = match.group(1), match.group(2), match.group(3)
+        prefix = clause[max(0, match.start() - 24):match.start()]
+        if POSSESSIVE_RE.search(prefix):
+            continue
+        amount = -int(value) if sign in "-−" else int(value)
+        for name in re.split(r"\s*/\s*", names):
+            found[name] = found.get(name, 0) + amount
+    for stat, sign, value in PHANTOM_RE.findall(clause):
+        amount = -int(value) if sign in "-−" else int(value)
+        name = stat.capitalize()
+        found[name] = found.get(name, 0) + amount
+    return found
 
-    if re.search(r"cooldown charge \+1", lowered):
-        tags.add("special_acceleration")
-    if re.search(r"cooldown charge -|cooldown count \+1", lowered):
-        tags.add("cooldown_guard")
-    if re.search(r"cooldown count-\d", lowered):
-        tags.add("special_ready")
-    if "neutralizes" in lowered and "penalties" in lowered:
-        tags.add("penalty_cleanse")
-    if "neutralizes foe's bonuses" in lowered:
-        tags.add("bonus_negation")
-    if "follow-up attack" in lowered:
-        tags.add("follow_up")
-    if "prevents foe's follow-up" in lowered:
-        tags.add("follow_up_denial")
-    if "another action" in lowered:
-        tags.add("refresh")
-    if "restores" in lowered and "hp" in lowered:
-        tags.add("healing")
-    if re.search(r"% of (unit|foe)'s (atk|spd|def|res)", lowered):
-        tags.add("stat_scaling")
-    if "as if granted" in lowered:
-        tags.add("phantom_stat")
-    if "effective against" in lowered:
-        tags.add("effective_damage")
-    if "savior" in lowered:
-        tags.add("savior")
-    if "canto" in lowered:
-        tags.add("canto")
+
+TURN_START_RE = re.compile(
+    r"at start of turn|at the start of turn|start of player phase|start of enemy phase",
+    re.I,
+)
+COMBAT_CONDITION_RE = re.compile(
+    r"if unit initiates combat|if foe initiates combat|at the start of combat|"
+    r"if unit's |if foe's ",
+    re.I,
+)
+
+
+def clause_tier(clause: str, category: str | None = None,
+                sentence: str | None = None) -> str:
+    """Which modifier tier a clause belongs to.
+
+    phantom  - "as if granted", comparison only
+    combat   - only applies during combat (Blow / Stance / Solo)
+    visible  - field buffs or debuffs granted for a turn / to allies
+    flat     - unconditional changes to the stat line (Life and Death, seals)
+    """
+    low = clause.lower()
+    bare = unquoted(low)
+    context = unquoted((sentence or clause).lower())
+    if "as if granted" in bare:
+        return "phantom"
+    if DURATION_RE.search(bare) or DURATION_RE.search(context) or TURN_START_RE.search(context):
+        return "visible"
+    if COMBAT_RE.search(bare) or COMBAT_RE.search(context) or COMBAT_CONDITION_RE.search(bare):
+        return "combat"
+    if "allies" in bare or "to target" in bare or "to allies" in bare:
+        return "visible"
+    if category == "assist":
+        return "visible"
+    return "flat"
+
+
+def clause_target(clause: str) -> str:
+    """Whose stat line the clause changes.
+
+    An untargeted "Inflicts Spd-5" is the unit's own stat cut (Brave weapons,
+    Life and Death, ...), while "Inflicts Def-6 on foe" hits the opponent.
+    """
+    low = clause.lower()
+    if FOE_TARGET_RE.search(low) and not ALLY_TARGET_RE.search(low):
+        return "foe"
+    return "ally"
+
+
+def add_modifier(mods: dict, target: str, tier: str, stat: str, value: int) -> None:
+    bucket = mods.setdefault(target, {}).setdefault(tier, {})
+    bucket[stat] = bucket.get(stat, 0) + value
+
+
+def flatten_modifiers(mods: dict) -> dict[str, int]:
+    flat: dict[str, int] = {}
+    for target, tiers in mods.items():
+        for tier, stats in tiers.items():
+            for stat, value in stats.items():
+                if not value:
+                    continue
+                key = f"{tier}_{stat.lower()}"
+                if target == "foe":
+                    key = f"foe_{key}"
+                flat[key] = flat.get(key, 0) + value
+    return dict(sorted(flat.items()))
+
+
+def modifier_totals(mods: dict, target: str) -> dict[str, int]:
+    """Sum every tier for one target, per stat (used for named-effect inference)."""
+    totals = {stat: 0 for stat in STATS}
+    for tier, stats in mods.get(target, {}).items():
+        for stat, value in stats.items():
+            totals[stat] = totals.get(stat, 0) + value
+    return totals
+
+
+# --------------------------------------------------------------------------- #
+# named effects + synergy targets
+# --------------------------------------------------------------------------- #
+
+EFFECT_ORDER = {entry["id"]: index for index, entry in enumerate(EFFECTS)}
+EFFECT_PROVIDES = {entry["id"]: entry["provides"] for entry in EFFECTS}
+
+
+NEGATION_RE = re.compile(r"neutraliz\w*[^.]{0,60}$", re.I)
+PATTERN_EFFECTS = [
+    (entry["id"],
+     [re.compile(pattern, re.I) for pattern in entry["patterns"]],
+     entry.get("negatable", False))
+    for entry in EFFECTS
+    if entry["patterns"]
+]
+
+
+def pattern_effects(text: str) -> set[str]:
+    found: set[str] = set()
+    for effect_id, patterns, negatable in PATTERN_EFFECTS:
+        for pattern in patterns:
+            matched = False
+            for match in pattern.finditer(text):
+                if negatable and NEGATION_RE.search(text[max(0, match.start() - 60):match.start()]):
+                    continue
+                matched = True
+                break
+            if matched:
+                found.update(EFFECT_PROVIDES.get(effect_id, [effect_id]))
+                break
+    return found
+
+
+def derived_effects(mods: dict) -> set[str]:
+    found: set[str] = set()
+    ally = mods.get("ally", {})
+    foe = mods.get("foe", {})
+    if any(v > 0 for v in ally.get("visible", {}).values()):
+        found.add("visible_buff_grant")
+    if any(v > 0 for v in ally.get("flat", {}).values()):
+        found.add("flat_stat_boost")
+    if ally.get("phantom"):
+        found.add("phantom_stat")
+    if any(v > 0 for v in ally.get("combat", {}).values()):
+        found.add("combat_stat_boost")
+    if any(v < 0 for v in foe.get("visible", {}).values()):
+        found.add("visible_debuff_apply")
+    if any(v < 0 for v in foe.get("combat", {}).values()):
+        found.add("combat_stat_debuff")
+    return found
+
+
+def check_stats(text: str) -> list[str]:
+    stats: list[str] = []
+    for pattern in CHECK_STAT_PATTERNS:
+        for match in re.finditer(pattern, text, re.I):
+            stat = match.group(1).capitalize()
+            if stat not in stats:
+                stats.append(stat)
+    return [stat for stat in STATS if stat in stats]
+
+
+def positive_match(pattern: str, text: str) -> bool:
+    """True when the pattern matches outside a "neutralizes ..." clause."""
+    for match in re.finditer(pattern, text, re.I):
+        prefix = text[max(0, match.start() - 60):match.start()]
+        if NEGATION_RE.search(prefix):
+            continue
+        return True
+    return False
+
+
+def synergy_targets(text: str, named: set[str], category: str, cd: int | None,
+                    checks: list[str]) -> list[str]:
+    targets: set[str] = set()
+    for target, patterns in TARGET_RULES:
+        if any(positive_match(pattern, text) for pattern in patterns):
+            targets.add(target)
+
     if category == "special" and (cd or 0) >= 3:
-        tags.add("high_cd_special")
+        targets.add("high_cooldown_special")
+    if checks:
+        targets.add("stat_comparison")
+    if {"null_follow_up", "guaranteed_follow_up", "brave_attack", "follow_up_denial"} & named:
+        targets.add("follow_up_control")
+    if "damage_reduction" in named and "healing" not in named and category != "weapon":
+        targets.add("sustain")
+    # A skill that heals itself does not need a sustain partner.
+    if "healing" in named:
+        targets.discard("sustain")
+    # A skill that already provides what it needs does not need a partner for it.
+    targets -= {target for target in targets if target in named and target not in SYNERGY_RULES}
+    return sorted(targets, key=lambda target: EFFECT_ORDER.get(target, 999))
 
-    for clause in split_clauses(desc):
+
+# --------------------------------------------------------------------------- #
+# skill analysis
+# --------------------------------------------------------------------------- #
+
+CLAUSE_PRIORITY = {"buff": 0, "debuff": 0, "flat": 1, "const": 2, "other": 3}
+
+
+def classify_clause(clause: str, deltas: dict[str, int], target: str, tier: str):
+    low = clause.lower()
+    if deltas:
+        return "debuff" if target == "foe" else "buff"
+    if "reduces damage" in low or TRUE_DAMAGE_RE.search(low) or HEAL_RE.search(low):
+        return "flat"
+    if CONST_RE.search(clause):
+        return "const"
+    return "other"
+
+
+def analyse_skill(desc: str, category: str, cd: int | None, name: str = "") -> dict:
+    body = main_text(desc)
+    mods: dict = {}
+    clauses: list[list] = []
+    seen: set[str] = set()
+
+    for clause, sentence_text in split_clauses(desc):
         low = clause.lower()
         if len(low) < 12:
             continue
         if low.startswith("(") and low.endswith(")"):
             continue
-
-        deltas = parse_stats(clause)
-        penalties = parse_penalties(clause)
-        inflicts = bool(re.search(r"inflicts?|penalt", low))
-        grants = "grant" in low
-        in_combat = "during combat" in low and "for 1 turn" not in low
-
-        if inflicts and (penalties or "penalt" in low):
-            for stat, value in penalties.items():
-                add_amount(foe, stat, value, in_combat)
-            summaries.append(["debuff", "foe", sentence(clause), in_combat])
-            tags.add("debuff")
-            if not in_combat:
-                tags.add("visible_debuff")
+        if (len(clause) < 80 and FRAGMENT_RE.match(clause.rstrip(". "))
+                and not EFFECT_VERB_RE.search(clause)):
             continue
+        if clause in seen:
+            continue
+        seen.add(clause)
 
-        if deltas and grants:
+        deltas = parse_stat_deltas(clause)
+        target = clause_target(clause)
+        tier = clause_tier(clause, category, sentence_text)
+        # "treats unit's Spd as if granted +7" boosts the unit's own comparison.
+        if tier == "phantom":
+            target = "ally"
+
+        if deltas:
             for stat, value in deltas.items():
-                add_amount(ally, stat, value, in_combat)
-            summaries.append(["buff", "ally", sentence(clause), in_combat])
-            tags.add("in_combat_buff" if in_combat else "visible_buff")
-            damage = TRUE_DAMAGE_RE.search(low)
-            if damage:
-                summaries.append(["flat", "foe", f"deals +{damage.group(1)} damage", in_combat])
-                tags.add("true_damage")
-            continue
+                add_modifier(mods, target, tier, stat, value)
 
-        if "reduces damage" in low and "neutraliz" not in low:
-            summaries.append(["flat", "ally", sentence(clause), True])
-            tags.add("damage_reduction")
-            if deltas:
-                for stat, value in deltas.items():
-                    add_amount(ally, stat, value, True)
-            continue
+        kind = classify_clause(clause, deltas, target, tier)
+        clauses.append([kind, target, tier, sentence(clause)])
 
-        if TRUE_DAMAGE_RE.search(low) or "deals +" in low:
-            summaries.append(["flat", "foe", sentence(clause), in_combat])
-            tags.add("true_damage")
-            continue
+    named = pattern_effects(body) | derived_effects(mods) | name_effects(name)
+    checks = check_stats(body)
+    targets = synergy_targets(body, named, category, cd, checks)
 
-        if "as if granted" in low:
-            summaries.append(["flat", "ally", sentence(clause), in_combat])
-            continue
+    clauses.sort(key=lambda row: (CLAUSE_PRIORITY.get(row[0], 9), row[2] != "combat"))
+    dropped = sum(1 for row in clauses if row[0] == "other")
+    kept = [row for row in clauses if row[0] != "other"][:8]
+    if not kept:
+        kept = clauses[:4]
+    elif dropped and len(kept) < 8:
+        kept += [row for row in clauses if row[0] == "other"][: 8 - len(kept)]
 
-        if "restores" in low and "hp" in low:
-            summaries.append(["flat", "ally", sentence(clause), in_combat])
-            tags.add("healing")
-            continue
+    return {
+        "named_effects": sorted(named, key=lambda effect: EFFECT_ORDER.get(effect, 999)),
+        "flat_modifiers": flatten_modifiers(mods),
+        "synergy_targets": targets,
+        "check_stats": checks,
+        "clauses": kept,
+        "mods": mods,
+    }
 
-        if re.search(r"\bX\s*=|equal to|\u00d7\s*\d|\d\s*\u00d7|% of ", clause):
-            summaries.append(["const", "none", sentence(clause), in_combat])
-            if grants or "+X" in clause:
-                tags.add("stat_scaling")
-            if grants and in_combat:
-                tags.add("in_combat_buff")
-            continue
 
-        if inflicts:
-            summaries.append(["debuff", "foe", sentence(clause), in_combat])
-            tags.add("debuff")
-            continue
-
-        if grants:
-            summaries.append(["buff", "ally", sentence(clause), in_combat])
-            continue
-
-        summaries.append(["other", "none", sentence(clause), in_combat])
-
-    # Drop repeated wording (refines sometimes repeat a base clause) and keep
-    # the payload small while retaining the most informative entries.
-    seen: set[str] = set()
-    unique: list[list] = []
-    for row in summaries:
-        if row[2] in seen:
-            continue
-        seen.add(row[2])
-        unique.append(row)
-    priority = {"buff": 0, "debuff": 0, "flat": 1, "const": 2, "other": 3}
-    unique.sort(key=lambda row: priority.get(row[0], 9))
-    summaries = unique[:7]
-
-    # Tags implied by accumulations (e.g. a purely numeric wording).
-    if any(v[0] for v in ally.values()):
-        tags.add("visible_buff")
-    if any(v[0] for v in foe.values()):
-        tags.update({"debuff", "visible_debuff"})
-
-    return {"a": ally, "f": foe, "sum": summaries, "tags": sorted(tags)}
-
+# --------------------------------------------------------------------------- #
+# build
+# --------------------------------------------------------------------------- #
 
 def clean_name(name: str) -> str:
     return re.sub(r"\s+", " ", name or "").strip()
@@ -318,23 +562,27 @@ def build(source: Path, out_dir: Path) -> None:
         if base:
             refines_of.setdefault(base, []).append(row["id"])
 
-    skills = []
+    skills: list[dict] = []
     by_id: dict[str, dict] = {}
 
     for raw in skills_raw:
         category = raw.get("category")
-        if category in NON_SLOT_CATEGORIES or category not in SLOT_CATEGORIES:
+        if category not in SLOT_BY_CATEGORY:
             continue
+
         desc = norm_text((descriptions.get(raw["id"]) or {}).get("full"))
         # Refine variants repeat their base skill's restrictions and prf status;
         # the raw export marks every refine as prf, which would hide generic ones.
         base_raw = raw_by_id.get(raw.get("base_id") or "")
-        restricted = (raw.get("restrictions") or (base_raw or {}).get("restrictions") or {})
+        restricted = raw.get("restrictions") or (base_raw or {}).get("restrictions") or {}
         is_prf = bool(base_raw.get("is_prf")) if base_raw else bool(raw.get("is_prf"))
         cd = raw.get("cd")
+
+        analysis = analyse_skill(desc, category, cd, clean_name(raw.get("name")))
         entry = {
             "id": raw["id"],
             "name": clean_name(raw.get("name")),
+            "slot": SLOT_BY_CATEGORY[category],
             "cat": category,
             "sp": raw.get("sp"),
             "tier": raw.get("tier"),
@@ -345,7 +593,11 @@ def build(source: Path, out_dir: Path) -> None:
             "prf": is_prf,
             "res": restricted,
             "desc": desc,
-            "fx": analyse_skill(desc, category, cd),
+            "named_effects": analysis["named_effects"],
+            "flat_modifiers": analysis["flat_modifiers"],
+            "synergy_targets": analysis["synergy_targets"],
+            "check_stats": analysis["check_stats"],
+            "clauses": analysis["clauses"],
         }
         if raw.get("base_id"):
             entry["base"] = raw["base_id"]
@@ -353,12 +605,10 @@ def build(source: Path, out_dir: Path) -> None:
         skills.append(entry)
         by_id[raw["id"]] = entry
 
-    skills.sort(key=lambda s: (s["cat"], s["name"].lower()))
+    skills.sort(key=lambda s: (s["slot"], s["name"].lower()))
 
-    units = []
     prf_by_unit: dict[str, list[str]] = {}
     kit: dict[str, dict] = {}
-
     for row in learn_raw:
         skill = by_id.get(row.get("skill_id"))
         if not skill:
@@ -373,35 +623,52 @@ def build(source: Path, out_dir: Path) -> None:
         default = row.get("default") or 0
         if default > 0:
             current = kit.setdefault(uid, {})
-            slot = skill["cat"]
-            if slot not in current or default > current[slot][1]:
-                current[slot] = (skill["id"], default)
+            if skill["cat"] not in current or default > current[skill["cat"]][1]:
+                current[skill["cat"]] = (skill["id"], default)
 
+    units = []
     for raw in units_raw:
         uid = raw["id"]
-        default_kit = {slot: sid for slot, (sid, _) in kit.get(uid, {}).items()}
-        units.append(
-            {
-                "id": uid,
-                "name": clean_name(raw.get("full_name") or raw.get("name")),
-                "wt": raw.get("weapon_type"),
-                "mv": raw.get("move_type"),
-                "book": raw.get("book"),
-                "ver": raw.get("version"),
-                "kit": default_kit,
-                "prf": prf_by_unit.get(uid, []),
-            }
-        )
-
+        units.append({
+            "id": uid,
+            "name": clean_name(raw.get("full_name") or raw.get("name")),
+            "wt": raw.get("weapon_type"),
+            "mv": raw.get("move_type"),
+            "book": raw.get("book"),
+            "ver": raw.get("version"),
+            "kit": {slot: value[0] for slot, value in kit.get(uid, {}).items()},
+            "prf": prf_by_unit.get(uid, []),
+        })
     units.sort(key=lambda u: u["name"].lower())
 
     out_dir.mkdir(parents=True, exist_ok=True)
     write_json(out_dir / "skills.json", skills)
     write_json(out_dir / "units.json", units)
+    write_json(out_dir / "effects.json", catalog())
 
     print(f"skills: {len(skills)}  units: {len(units)}")
-    for path in (out_dir / "skills.json", out_dir / "units.json"):
+    for name in ("skills.json", "units.json", "effects.json"):
+        path = out_dir / name
         print(f"  {path}  {path.stat().st_size / 1024:.0f} KiB")
+    report(skills)
+
+
+def report(skills: list[dict]) -> None:
+    """Print a short coverage summary, useful after a data refresh."""
+    from collections import Counter
+
+    effects = Counter()
+    targets = Counter()
+    for skill in skills:
+        effects.update(skill["named_effects"])
+        effects.update(f"+{target}" for target in skill["synergy_targets"])
+        targets.update(skill["synergy_targets"])
+    print("\ntop named effects:")
+    for effect, count in effects.most_common(14):
+        print(f"  {count:5d}  {effect}")
+    print("\nsynergy targets:")
+    for target, count in sorted(targets.items()):
+        print(f"  {count:5d}  {target}")
 
 
 def write_json(path: Path, payload) -> None:
